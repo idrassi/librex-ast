@@ -150,25 +150,67 @@
 ===============================================================================
 */
 
+#ifdef _WIN32
+#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_NONSTDC_NO_WARNINGS
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include "regex-parser.h"
 
+// Opaque struct definition, hidden from the public header.
+struct regex_compiled {
+    RegexNode* ast;
+    AstArena* arena;
+    uint32_t flags;
+    int capture_count;
+    regex_allocator allocator;
+};
+
 // ----------------------------------------------------------------------------
-// 1. Arena Allocation for Performance
+// 1. Allocator Implementation
+// ----------------------------------------------------------------------------
+
+// Default allocator implementation using standard library functions
+static void* default_malloc(size_t size, void* user_data) {
+    (void)user_data; // Unused
+    return malloc(size);
+}
+
+static void default_free(void* ptr, void* user_data) {
+    (void)user_data; // Unused
+    free(ptr);
+}
+
+static void* default_realloc(void* ptr, size_t new_size, void* user_data) {
+    (void)user_data; // Unused
+    return realloc(ptr, new_size);
+}
+
+// Global static instance of the default allocator for convenience.
+static const regex_allocator default_allocator = {
+    .malloc_func = default_malloc,
+    .free_func = default_free,
+    .realloc_func = default_realloc,
+    .user_data = NULL
+};
+
+// ----------------------------------------------------------------------------
+// 2. Arena Allocation
 // ----------------------------------------------------------------------------
 
 static void *arena_alloc(AstArena *arena, size_t size) {
     if (!arena->blocks || arena->blocks->used + size > arena->blocks->cap) {
         size_t cap = size > 64*1024 ? size : 64*1024;
-        Block *block = malloc(sizeof(Block));
+        Block *block = arena->allocator.malloc_func(sizeof(Block), arena->allocator.user_data);
         if (!block) return NULL;
         
-        block->data = malloc(cap);
+        block->data = arena->allocator.malloc_func(cap, arena->allocator.user_data);
         if (!block->data) {
-            free(block);
+            arena->allocator.free_func(block, arena->allocator.user_data);
             return NULL;
         }
         
@@ -188,8 +230,8 @@ static void arena_free(AstArena *arena) {
     Block *block = arena->blocks;
     while (block) {
         Block *next = block->next;
-        free(block->data);
-        free(block);
+        arena->allocator.free_func(block->data, arena->allocator.user_data);
+        arena->allocator.free_func(block, arena->allocator.user_data);
         block = next;
     }
     arena->blocks = NULL;
@@ -197,7 +239,103 @@ static void arena_free(AstArena *arena) {
 }
 
 // ----------------------------------------------------------------------------
-// 2. UTF-8 Decoder (Thread-safe, no locale dependency)
+// 3. Error Handling
+// ----------------------------------------------------------------------------
+
+static const char* error_messages[] = {
+    [REGEX_OK] = "Success",
+    [REGEX_ERR_MEMORY] = "Memory allocation failed",
+    [REGEX_ERR_INVALID_SYNTAX] = "Invalid regex syntax",
+    [REGEX_ERR_INVALID_UTF8] = "Invalid UTF-8 sequence",
+    [REGEX_ERR_INVALID_ESCAPE] = "Invalid escape sequence",
+    [REGEX_ERR_INVALID_CLASS] = "Invalid character class syntax",
+    [REGEX_ERR_INVALID_QUANT] = "Invalid quantifier",
+    [REGEX_ERR_INVALID_GROUP] = "Invalid group syntax",
+    [REGEX_ERR_INVALID_BACKREF] = "Invalid backreference",
+    [REGEX_ERR_INVALID_PROP] = "Unknown Unicode property",
+    [REGEX_ERR_UNMATCHED_PAREN] = "Unmatched parenthesis",
+    [REGEX_ERR_INVALID_RANGE] = "Invalid range in character class",
+    [REGEX_ERR_LOOKBEHIND_VAR] = "Lookbehind assertion is not fixed-length",
+    [REGEX_ERR_LOOKBEHIND_LONG] = "Lookbehind assertion is too long",
+    [REGEX_ERR_DUPLICATE_NAME] = "Duplicate capture group name",
+    [REGEX_ERR_UNDEFINED_GROUP] = "Reference to undefined group",
+    [REGEX_ERR_INVALID_CONDITION] = "Invalid conditional pattern",
+};
+
+const char* regex_error_message(int error_code) {
+    size_t num_errors = sizeof(error_messages) / sizeof(error_messages[0]);
+    if (error_code < 0 || (size_t)error_code >= num_errors) {
+        return "Unknown error";
+    }
+    return error_messages[error_code];
+}
+
+// ----------------------------------------------------------------------------
+// 4. Updated Parser State and Error Handling
+// ----------------------------------------------------------------------------
+
+// Fixup structure for deferred validation
+typedef struct {
+    RegexNode *node;
+    char *name;
+} Fixup;
+
+// Parser state
+typedef struct {
+    const char *pattern;
+    int pos;
+    int capture_count;
+    regex_err error;
+    bool has_error;
+    int line_number;
+    int column_start;
+    char **named_groups;
+    int named_group_count;
+    int named_group_capacity;
+    uint32_t flags;
+    AstArena *arena;
+    Fixup *fixups;
+    int fixup_count;
+    int fixup_capacity;
+    unsigned compile_flags;
+    bool in_conditional;
+} ParserState;
+
+// Wrapper for strdup using the provided allocator
+static char* pstrdup(ParserState* state, const char* s) {
+    if (!s) return NULL;
+    size_t len = strlen(s) + 1;
+    char* new_str = state->arena->allocator.malloc_func(len, state->arena->allocator.user_data);
+    if (!new_str) return NULL;
+    memcpy(new_str, s, len);
+    return new_str;
+}
+
+// Updated set_error to populate the structured error object
+void set_error(ParserState *state, int error_code, const char *msg_override) {
+    if (state->has_error) return;
+
+    int line = 1;
+    int col = 1;
+    for (int i = 0; i < state->pos; i++) {
+        if (state->pattern[i] == '\n') {
+            line++;
+            col = 1;
+        } else {
+            col++;
+        }
+    }
+
+    state->error.code = error_code;
+    state->error.pos = state->pos;
+    state->error.line = line;
+    state->error.col = col;
+    state->error.msg = msg_override ? msg_override : regex_error_message(error_code);
+    state->has_error = true;
+}
+
+// ----------------------------------------------------------------------------
+// 5. UTF-8 Decoder and Unicode Support
 // ----------------------------------------------------------------------------
 
 static size_t utf8_decode(const char *str, uint32_t *codepoint) {
@@ -222,10 +360,13 @@ static size_t utf8_decode(const char *str, uint32_t *codepoint) {
     return 0;
 }
 
-static char *ascii_lower(const char *str) {
+static char *ascii_lower(const char *str, ParserState* state) {
     size_t len = strlen(str);
-    char *result = malloc(len + 1);
-    if (!result) return NULL;
+    char *result = state->arena->allocator.malloc_func(len + 1, state->arena->allocator.user_data);
+    if (!result) {
+        set_error(state, REGEX_ERR_MEMORY, NULL);
+        return NULL;
+    }
     
     for (size_t i = 0; i < len; i++) {
         result[i] = tolower(str[i]);
@@ -235,7 +376,7 @@ static char *ascii_lower(const char *str) {
 }
 
 // ----------------------------------------------------------------------------
-// 3. Unicode Properties Support
+// 6. Unicode Properties Support
 // ----------------------------------------------------------------------------
 
 // Unicode category mappings - simplified version for demonstration
@@ -410,7 +551,7 @@ static uint32_t* build_unicode_bitmap(const char* prop_name) {
 }
 
 // Find cached bitmap or compute it
-static uint32_t* get_cached_bitmap(const char* prop_name) {
+static uint32_t* get_cached_bitmap(ParserState* state, const char* prop_name) {
     // Check cache first
     for (int i = 0; i < property_cache_count; i++) {
         if (property_cache[i].name && strcmp(property_cache[i].name, prop_name) == 0) {
@@ -427,7 +568,7 @@ static uint32_t* get_cached_bitmap(const char* prop_name) {
     uint32_t* bitmap = build_unicode_bitmap(prop_name);
     if (bitmap) {
         // Add to cache
-        property_cache[property_cache_count].name = strdup(prop_name);
+        property_cache[property_cache_count].name = pstrdup(state, prop_name);
         property_cache[property_cache_count].bitmap = bitmap;
         property_cache[property_cache_count].computed = true;
         property_cache_count++;
@@ -474,12 +615,12 @@ static bool unicode_property_exists(const char* name) {
 }
 
 // Enhanced bitmap retrieval function
-static uint32_t* unicode_bitmap_for(const char* name) {
+static uint32_t* unicode_bitmap_for(ParserState* state, const char* name) {
     if (!name || !unicode_property_exists(name)) {
         return NULL;
     }
     
-    return get_cached_bitmap(name);
+    return get_cached_bitmap(state, name);
 }
 
 // Cleanup function for property cache
@@ -497,64 +638,23 @@ void regex_cleanup_property_cache(void) {
     property_cache_count = 0;
 }
 
-// Function to test if a codepoint matches a property
-bool matches_unicode_property(uint32_t codepoint, const char* prop_name, bool negated) {
-    uint32_t* bitmap = unicode_bitmap_for(prop_name);
-    if (!bitmap) return negated; // If property doesn't exist, return negated value
-    
-    bool matches = is_bit_set_in_bitmap(bitmap, codepoint);
-    return negated ? !matches : matches;
-}
-
 // ----------------------------------------------------------------------------
-// 4. Enhanced Data Structures for the AST
-// ----------------------------------------------------------------------------
-
-// Fixup structure for deferred validation
-typedef struct {
-    RegexNode *node;
-    char *name;
-} Fixup;
-
-// Parser state
-typedef struct {
-    const char *pattern;
-    int pos;
-    int capture_count;
-    char error_msg[256];
-    bool has_error;
-    int line_number;
-    int column_start;
-    char **named_groups;
-    int named_group_count;
-    int named_group_capacity;
-    uint32_t flags;
-    AstArena *arena;
-    Fixup *fixups;
-    int fixup_count;
-    int fixup_capacity;
-    unsigned compile_flags;
-    bool in_conditional;
-} ParserState;
-
-// ----------------------------------------------------------------------------
-// 5. Forward declarations
+// 7. Forward declarations
 // ----------------------------------------------------------------------------
 RegexNode* parse_regex(ParserState *state);
 RegexNode* parse_term(ParserState *state);
 RegexNode* parse_factor(ParserState *state);
 RegexNode* parse_atom(ParserState *state);
-void free_regex_ast(RegexNode *node);
-void set_error(ParserState *state, const char *msg);
+void set_error(ParserState *state, int error_code, const char *msg_override);
 static int compute_width(RegexNode *node, int *min, int *max);
 
 // ----------------------------------------------------------------------------
-// 6. Helper functions for creating AST nodes
+// 8. Helper functions for creating AST nodes
 // ----------------------------------------------------------------------------
 RegexNode* create_node(RegexNodeType type, ParserState *state) {
     RegexNode *node = (RegexNode*)arena_alloc(state->arena, sizeof(RegexNode));
     if (!node) {
-        set_error(state, "Memory allocation failed");
+        set_error(state, REGEX_ERR_MEMORY, NULL);
         return NULL;
     }
     memset(node, 0, sizeof(RegexNode));
@@ -683,22 +783,23 @@ RegexNode* create_subroutine_node(bool is_recursion, int target_index, char *tar
 }
 
 // ----------------------------------------------------------------------------
-// 7. Fixup system for deferred validation
+// 9. Fixup and Named Group Management
 // ----------------------------------------------------------------------------
 
 static void add_fixup(ParserState *state, RegexNode *node, char *name) {
     if (state->fixup_count >= state->fixup_capacity) {
         state->fixup_capacity = state->fixup_capacity > 0 ? state->fixup_capacity * 2 : 8;
-        Fixup *new_fixups = realloc(state->fixups, state->fixup_capacity * sizeof(Fixup));
+        Fixup *new_fixups = state->arena->allocator.realloc_func(
+            state->fixups, state->fixup_capacity * sizeof(Fixup), state->arena->allocator.user_data);
         if (!new_fixups) {
-            set_error(state, "Memory allocation failed for fixups");
+            set_error(state, REGEX_ERR_MEMORY, NULL);
             return;
         }
         state->fixups = new_fixups;
     }
     
     state->fixups[state->fixup_count].node = node;
-    state->fixups[state->fixup_count].name = strdup(name);
+    state->fixups[state->fixup_count].name = pstrdup(state, name);
     state->fixup_count++;
 }
 
@@ -724,9 +825,9 @@ static void process_fixups(ParserState *state) {
             }
         } else {
              if (fixup->node->type == NODE_BACKREF) {
-                set_error(state, "Backreference to undefined named group");
+                set_error(state, REGEX_ERR_UNDEFINED_GROUP, "Backreference to undefined named group");
              } else {
-                set_error(state, "Subroutine call to undefined named group");
+                set_error(state, REGEX_ERR_UNDEFINED_GROUP, "Subroutine call to undefined named group");
              }
              return;
         }
@@ -734,7 +835,7 @@ static void process_fixups(ParserState *state) {
 }
 
 // ----------------------------------------------------------------------------
-// 8. Named group management
+// 10. Named group management
 // ----------------------------------------------------------------------------
 
 static bool find_named_group(ParserState *state, const char *name) {
@@ -747,24 +848,27 @@ static bool find_named_group(ParserState *state, const char *name) {
 }
 
 static bool add_named_group(ParserState *state, const char *name) {
-    if (find_named_group(state, name)) {
-        set_error(state, "Duplicate capture group name");
-        return false;
+    for (int i = 0; i < state->named_group_count; i++) {
+        if (strcmp(state->named_groups[i], name) == 0) {
+            set_error(state, REGEX_ERR_DUPLICATE_NAME, NULL);
+            return false;
+        }
     }
 
     if (state->named_group_count >= state->named_group_capacity) {
         state->named_group_capacity = state->named_group_capacity > 0 ? state->named_group_capacity * 2 : 8;
-        char **new_groups = realloc(state->named_groups, state->named_group_capacity * sizeof(char*));
+        char **new_groups = state->arena->allocator.realloc_func(
+            state->named_groups, state->named_group_capacity * sizeof(char*), state->arena->allocator.user_data);
         if (!new_groups) {
-            set_error(state, "Memory allocation failed for named groups");
+            set_error(state, REGEX_ERR_MEMORY, NULL);
             return false;
         }
         state->named_groups = new_groups;
     }
     
-    state->named_groups[state->named_group_count] = strdup(name);
+    state->named_groups[state->named_group_count] = pstrdup(state, name);
     if (!state->named_groups[state->named_group_count]) {
-        set_error(state, "Memory allocation failed for group name");
+        set_error(state, REGEX_ERR_MEMORY, NULL);
         return false;
     }
     state->named_group_count++;
@@ -772,33 +876,15 @@ static bool add_named_group(ParserState *state, const char *name) {
 }
 
 // ----------------------------------------------------------------------------
-// 9. Parser utilities
+// 11. Parser utilities
 // ----------------------------------------------------------------------------
-
-void set_error(ParserState *state, const char *msg) {
-    if (state->has_error) return;
-
-    int line = 1;
-    int col = 1;
-    for (int i = 0; i < state->pos; i++) {
-        if (state->pattern[i] == '\n') {
-            line++;
-            col = 1;
-        } else {
-            col++;
-        }
-    }
-
-    snprintf(state->error_msg, sizeof(state->error_msg), "Error at line %d, column %d: %s", line, col, msg);
-    state->has_error = true;
-}
 
 static uint32_t peek_codepoint(ParserState *state) {
     if (state->pattern[state->pos] == '\0') return 0;
     uint32_t codepoint;
     size_t len = utf8_decode(&state->pattern[state->pos], &codepoint);
     if (len == 0) {
-        set_error(state, "Invalid UTF-8 sequence");
+        set_error(state, REGEX_ERR_INVALID_UTF8, NULL);
         return 0;
     }
     return codepoint;
@@ -811,7 +897,7 @@ static uint32_t next_codepoint(ParserState *state) {
     uint32_t codepoint;
     size_t len = utf8_decode(&state->pattern[state->pos], &codepoint);
     if (len == 0) {
-        set_error(state, "Invalid UTF-8 sequence");
+        set_error(state, REGEX_ERR_INVALID_UTF8, NULL);
         return 0;
     }
     
@@ -859,13 +945,13 @@ static char* parse_plain_name(ParserState *state) {
     }
     int end = state->pos;
     if (end == start) {
-        set_error(state, "Missing name in subroutine call");
+        set_error(state, REGEX_ERR_INVALID_CONDITION, "Missing name in subroutine call");
         return NULL;
     }
     int len = end - start;
     char *name = malloc(len + 1);
     if (!name) {
-        set_error(state, "Memory allocation failed");
+        set_error(state, REGEX_ERR_MEMORY, NULL);
         return NULL;
     }
     memcpy(name, &state->pattern[start], len);
@@ -885,7 +971,7 @@ static bool is_quantifier(uint32_t cp) {
 }
 
 // ----------------------------------------------------------------------------
-// 10. Width analysis for lookbehind validation
+// 12. Width analysis for lookbehind validation
 // ----------------------------------------------------------------------------
 
 static int compute_width(RegexNode *node, int *min, int *max) {
@@ -959,15 +1045,15 @@ static void check_lookbehind(RegexNode *node, ParserState *state) {
     int min, max;
     compute_width(node, &min, &max);
     if (min != max) {
-        set_error(state, "Lookbehind assertion is not fixed length");
+        set_error(state, REGEX_ERR_LOOKBEHIND_VAR, "Lookbehind assertion is not fixed length");
     }
     if (max > 255) { // PCRE limit
-        set_error(state, "Lookbehind assertion is too long");
+        set_error(state, REGEX_ERR_LOOKBEHIND_LONG, "Lookbehind assertion is too long");
     }
 }
 
 // ----------------------------------------------------------------------------
-// 11. Flag parsing for inline modifiers
+// 13. Flag parsing for inline modifiers
 // ----------------------------------------------------------------------------
 
 static void scan_flag_string(const char *str, int *pos, uint32_t *flags) {
@@ -1001,7 +1087,7 @@ static void scan_flag_string(const char *str, int *pos, uint32_t *flags) {
 }
 
 // ----------------------------------------------------------------------------
-// 12. Parsing functions
+// 14. Parsing functions
 // ----------------------------------------------------------------------------
 
 char* parse_char_class_content(ParserState *state, bool *is_posix) {
@@ -1016,7 +1102,7 @@ char* parse_char_class_content(ParserState *state, bool *is_posix) {
 
     while (state->pattern[state->pos] != '\0') {
         if (state->pattern[state->pos] == '\n') {
-            set_error(state, "Invalid newline in character class");
+            set_error(state, REGEX_ERR_INVALID_SYNTAX, "Invalid newline in character class");
             return NULL;
         }
 
@@ -1044,14 +1130,14 @@ char* parse_char_class_content(ParserState *state, bool *is_posix) {
     }
 
     if (nesting_level != 0) {
-        set_error(state, "Unmatched '[' in character class");
+        set_error(state, REGEX_ERR_INVALID_SYNTAX, "Unmatched '[' in character class");
         return NULL;
     }
 
     int len = state->pos - start_pos;
     char *content = malloc(len + 1);
     if (!content) {
-        set_error(state, "Memory allocation failed");
+        set_error(state, REGEX_ERR_MEMORY, NULL);
         return NULL;
     }
     memcpy(content, &state->pattern[start_pos], len);
@@ -1063,7 +1149,7 @@ char* parse_char_class_content(ParserState *state, bool *is_posix) {
 char* parse_group_name(ParserState *state) {
     uint32_t first = peek_codepoint(state);
     if (!(first >= 'A' && first <= 'Z') && !(first >= 'a' && first <= 'z') && first != '_') {
-        set_error(state, "Invalid group name: must start with letter or underscore");
+        set_error(state, REGEX_ERR_INVALID_SYNTAX, "Invalid group name: must start with letter or underscore");
         return NULL;
     }
     
@@ -1080,7 +1166,7 @@ char* parse_group_name(ParserState *state) {
     }
     
     if (!match_codepoint(state, '>')) {
-        set_error(state, "Unmatched '<' in named group");
+        set_error(state, REGEX_ERR_UNMATCHED_PAREN, "Unmatched '<' in named group");
         return NULL;
     }
     
@@ -1088,7 +1174,7 @@ char* parse_group_name(ParserState *state) {
     int len = end - start;
     char *name = malloc(len + 1);
     if (!name) {
-        set_error(state, "Memory allocation failed");
+        set_error(state, REGEX_ERR_MEMORY, NULL);
         return NULL;
     }
     memcpy(name, &state->pattern[start], len);
@@ -1109,7 +1195,7 @@ static Condition parse_condition(ParserState *state) {
             cond.type = COND_ASSERTION;
             return cond;
         }
-        set_error(state, "Condition is not a valid assertion");
+        set_error(state, REGEX_ERR_INVALID_CONDITION, "Condition is not a valid assertion");
         return cond;
     }
 
@@ -1118,7 +1204,7 @@ static Condition parse_condition(ParserState *state) {
         cond.type = COND_ASSERTION;
         cond.data.assertion = parse_atom(state);
         if (state->has_error || !cond.data.assertion || cond.data.assertion->type != NODE_ASSERTION) {
-            set_error(state, "Condition is not a valid assertion");
+            set_error(state, REGEX_ERR_INVALID_CONDITION, "Condition is not a valid assertion");
             cond.type = COND_INVALID;
         }
     } else if (peek_codepoint(state) == '<' || peek_codepoint(state) == '\'') {
@@ -1131,14 +1217,14 @@ static Condition parse_condition(ParserState *state) {
             next_codepoint(state);
         }
         if (!match_codepoint(state, closer)) {
-            set_error(state, "Unclosed named condition");
+            set_error(state, REGEX_ERR_UNMATCHED_PAREN, "Unclosed named condition");
             cond.type = COND_INVALID;
             return cond;
         }
         int len = state->pos - start - 1;
         cond.data.group_name = malloc(len + 1);
         if (!cond.data.group_name) {
-            set_error(state, "Memory allocation failed");
+            set_error(state, REGEX_ERR_MEMORY, NULL);
             cond.type = COND_INVALID;
             return cond;
         }
@@ -1147,20 +1233,20 @@ static Condition parse_condition(ParserState *state) {
         /* Make sure that name has already been declared. */
         if (cond.type == COND_NAMED) {
             if (find_named_group_index(state, cond.data.group_name) == -1) {
-                set_error(state, "Conditional references undefined named group");
+                set_error(state, REGEX_ERR_UNDEFINED_GROUP, "Conditional references undefined named group");
                 cond.type = COND_INVALID;
             }
         }
     } else if (peek_codepoint(state) >= '0' && peek_codepoint(state) <= '9') {
         cond.type = COND_NUMERIC;
         if (!parse_number(state, &cond.data.group_index, 0)) {
-            set_error(state, "Invalid group number in condition");
+            set_error(state, REGEX_ERR_INVALID_CONDITION, "Invalid group number in condition");
             cond.type = COND_INVALID;
         } else {
             /* The group must already exist (i.e. be to the left).            */
             if (cond.data.group_index <= 0 ||
                 cond.data.group_index > state->capture_count) {
-                set_error(state, "Conditional references undefined group");
+                set_error(state, REGEX_ERR_UNDEFINED_GROUP, "Conditional references undefined group");
                 cond.type = COND_INVALID;
             }
         }
@@ -1174,7 +1260,7 @@ static Condition parse_condition(ParserState *state) {
             cond.data.assertion = assertion;
         } else {
             state->pos = old_pos;
-            set_error(state, "Invalid condition");
+            set_error(state, REGEX_ERR_INVALID_CONDITION, "Invalid condition");
         }
     }
     
@@ -1215,7 +1301,7 @@ RegexNode* parse_factor(ParserState *state) {
     // Anchors and assertions cannot be quantified
     if (atom->type == NODE_ANCHOR || atom->type == NODE_ASSERTION) {
         if (is_quantifier(peek_codepoint(state))) {
-            set_error(state, "Cannot quantify an anchor or assertion");
+            set_error(state, REGEX_ERR_INVALID_QUANT, "Cannot quantify an anchor or assertion");
             return NULL;
         }
     }
@@ -1231,28 +1317,28 @@ RegexNode* parse_factor(ParserState *state) {
     } else if (q == '{') {
         next_codepoint(state);
         if (!parse_number(state, &min, 0)) {
-            set_error(state, "Expected number in quantifier {}");
+            set_error(state, REGEX_ERR_INVALID_QUANT, "Expected number in quantifier {}");
             return NULL;
         }
         if (match_codepoint(state, ',')) {
             if (peek_codepoint(state) == '}') {
                 max = -1;
             } else if (!parse_number(state, &max, 0)) {
-                set_error(state, "Expected number after comma in quantifier {}");
+                set_error(state, REGEX_ERR_INVALID_QUANT, "Expected number after comma in quantifier {}");
                 return NULL;
             }
         } else {
             max = min;
         }
         if (!match_codepoint(state, '}')) {
-            set_error(state, "Unmatched '{' in quantifier");
+            set_error(state, REGEX_ERR_UNMATCHED_PAREN, "Unmatched '{' in quantifier");
             return NULL;
         }
     }
 
     if (min != -1) {
         if (min < 0 || (max != -1 && min > max)) {
-            set_error(state, "Invalid range in quantifier");
+            set_error(state, REGEX_ERR_INVALID_QUANT, "Invalid range in quantifier");
             return NULL;
         }
         
@@ -1263,7 +1349,7 @@ RegexNode* parse_factor(ParserState *state) {
         }
         
         if (is_quantifier(peek_codepoint(state))) {
-            set_error(state, "Double quantifier");
+            set_error(state, REGEX_ERR_INVALID_QUANT, "Double quantifier");
             return NULL;
         }
         
@@ -1301,7 +1387,7 @@ RegexNode* parse_atom(ParserState *state) {
                         alt = create_alternation_node(alt, more, state);
                         if (!alt) return NULL;
                     }
-                    if (!match_codepoint(state, ')')) { set_error(state, "Unmatched '(' for branch reset group"); return NULL; }
+                    if (!match_codepoint(state, ')')) { set_error(state, REGEX_ERR_UNMATCHED_PAREN, "Unmatched '(' for branch reset group"); return NULL; }
                     RegexNode *node = create_node(NODE_BRESET_GROUP, state);
                     if (!node) return NULL;
                     node->data.group.child = alt;
@@ -1324,7 +1410,7 @@ RegexNode* parse_atom(ParserState *state) {
                     ')' that closes the assertion already plays that role. */
                     if (cond.type != COND_ASSERTION) {
                         if (!match_codepoint(state, ')')) {
-                            set_error(state, "Expected ')' after condition");
+                            set_error(state, REGEX_ERR_UNMATCHED_PAREN, "Expected ')' after condition");
                             state->in_conditional = false;
                             return NULL;
                         }
@@ -1347,7 +1433,7 @@ RegexNode* parse_atom(ParserState *state) {
                     }
                     state->in_conditional = false;
                     
-                    if (!match_codepoint(state, ')')) { set_error(state, "Unmatched '(' for conditional"); return NULL; }
+                    if (!match_codepoint(state, ')')) { set_error(state, REGEX_ERR_UNMATCHED_PAREN, "Unmatched '(' for conditional"); return NULL; }
                     
                     return create_conditional_node(cond, yes, no, state);
                 }
@@ -1366,7 +1452,7 @@ RegexNode* parse_atom(ParserState *state) {
                     case '#':
                         next_codepoint(state);
                         while (peek_codepoint(state) != ')' && peek_codepoint(state) != 0) next_codepoint(state);
-                        if (!match_codepoint(state, ')')) { set_error(state, "Unclosed comment"); return NULL; }
+                        if (!match_codepoint(state, ')')) { set_error(state, REGEX_ERR_INVALID_SYNTAX, "Unclosed comment"); return NULL; }
                         return create_node(NODE_COMMENT, state);
                     case '<': {
                         next_codepoint(state);
@@ -1388,7 +1474,7 @@ RegexNode* parse_atom(ParserState *state) {
                         if (match_codepoint(state, ':')) {
                             RegexNode *child = parse_regex(state);
                             if (state->has_error) { state->flags = old_flags; return NULL; }
-                            if (!match_codepoint(state, ')')) { set_error(state, "Unmatched '(' for scoped flags"); state->flags = old_flags; return NULL; }
+                            if (!match_codepoint(state, ')')) { set_error(state, REGEX_ERR_UNMATCHED_PAREN, "Unmatched '(' for scoped flags"); state->flags = old_flags; return NULL; }
                             RegexNode *group = create_group_node(child, -1, NULL, false, state);
                             if (!group) { state->flags = old_flags; return NULL; }
                             group->data.group.enter_flags = old_flags;
@@ -1397,7 +1483,7 @@ RegexNode* parse_atom(ParserState *state) {
                             return group;
                         } else if (match_codepoint(state, ')')) {
                             return create_group_node(NULL, -1, NULL, false, state);
-                        } else { set_error(state, "Expected ':' or ')' after flags"); return NULL; }
+                        } else { set_error(state, REGEX_ERR_INVALID_SYNTAX, "Expected ':' or ')' after flags"); return NULL; }
                     }
                     default: {
                         int num_val = 0;
@@ -1410,14 +1496,14 @@ RegexNode* parse_atom(ParserState *state) {
                         if (match_codepoint(state, '&')) {
                             char *target_name = parse_plain_name(state);
                             if (!target_name) return NULL;
-                            if (!match_codepoint(state, ')')) { set_error(state, "Unclosed subroutine call"); free(target_name); return NULL; }
+                            if (!match_codepoint(state, ')')) { set_error(state, REGEX_ERR_INVALID_SYNTAX, "Unclosed subroutine call"); free(target_name); return NULL; }
                             RegexNode *node = create_subroutine_node(false, 0, target_name, state);
                             if (!node) { free(target_name); return NULL; }
                             add_fixup(state, node, target_name);
                             return node;
                         }
 
-                        set_error(state, "Invalid syntax after '(?'"); return NULL;
+                        set_error(state, REGEX_ERR_INVALID_SYNTAX, "Invalid syntax after '(?'"); return NULL;
                     }
                 }
                 // Common logic for groups parsed above
@@ -1427,7 +1513,7 @@ RegexNode* parse_atom(ParserState *state) {
                 }
                 RegexNode *sub_expr = parse_regex(state);
                 if (state->has_error) { free(name); return NULL; }
-                if (!match_codepoint(state, ')')) { set_error(state, "Unmatched '('"); free(name); return NULL; }
+                if (!match_codepoint(state, ')')) { set_error(state, REGEX_ERR_UNMATCHED_PAREN, "Unmatched '('"); free(name); return NULL; }
                 
                 if (is_assertion) {
                     if (assert_type == ASSERT_LOOKBEHIND_POS || assert_type == ASSERT_LOOKBEHIND_NEG) {
@@ -1444,7 +1530,7 @@ RegexNode* parse_atom(ParserState *state) {
             int capture_index = ++state->capture_count;
             RegexNode *sub_expr = parse_regex(state);
             if (state->has_error) return NULL;
-            if (!match_codepoint(state, ')')) { set_error(state, "Unmatched '('"); return NULL; }
+            if (!match_codepoint(state, ')')) { set_error(state, REGEX_ERR_UNMATCHED_PAREN, "Unmatched '('"); return NULL; }
             return create_group_node(sub_expr, capture_index, NULL, false, state);
         }
         
@@ -1457,14 +1543,14 @@ RegexNode* parse_atom(ParserState *state) {
             if (!is_posix && set[0] == '\0' && !negated) {
                  if (state->pattern[state->pos - 2] == ']') { // check for []
                     free(set);
-                    set_error(state, "Empty character class");
+                    set_error(state, REGEX_ERR_INVALID_CLASS, "Empty character class");
                     return NULL;
                 }
             }
             for (int i = 0; set[i]; i++) {
                 if (set[i] == '\\' && (set[i+1] == 'd' || set[i+1] == 'D' || set[i+1] == 'w' || set[i+1] == 'W' || set[i+1] == 's' || set[i+1] == 'S') && set[i+2] == '-') {
                     free(set);
-                    set_error(state, "Invalid range in character class");
+                    set_error(state, REGEX_ERR_INVALID_RANGE, "Invalid range in character class");
                     return NULL;
                 }
             }
@@ -1473,26 +1559,26 @@ RegexNode* parse_atom(ParserState *state) {
         
         case '\\': {
             uint32_t escaped = next_codepoint(state);
-            if (escaped == 0) { set_error(state, "Incomplete escape"); return NULL; }
+            if (escaped == 0) { set_error(state, REGEX_ERR_INVALID_ESCAPE, "Incomplete escape"); return NULL; }
 
             if (escaped == 'p' || escaped == 'P') {
                 bool neg = (escaped == 'P');
-                if (!match_codepoint(state, '{')) { set_error(state, "Expected '{' after \\p"); return NULL; }
+                if (!match_codepoint(state, '{')) { set_error(state, REGEX_ERR_INVALID_SYNTAX, "Expected '{' after \\p"); return NULL; }
                 int start = state->pos;
                 while (peek_codepoint(state) != '}' && peek_codepoint(state) != 0) next_codepoint(state);
-                if (!match_codepoint(state, '}')) { set_error(state, "Unclosed property escape"); return NULL; }
-                
+                if (!match_codepoint(state, '}')) { set_error(state, REGEX_ERR_INVALID_SYNTAX, "Unclosed property escape"); return NULL; }
+
                 int len = state->pos - start - 1;
                 char *raw = malloc(len + 1);
-                if (!raw) { set_error(state, "Memory allocation failed"); return NULL; }
+                if (!raw) { set_error(state, REGEX_ERR_MEMORY, NULL); return NULL; }
                 memcpy(raw, &state->pattern[start], len);
                 raw[len] = '\0';
                 
-                char *name = ascii_lower(raw);
+                char *name = ascii_lower(raw, state);
                 free(raw);
                 
-                if (!unicode_property_exists(name)) { set_error(state, "Unknown Unicode property"); free(name); return NULL; }
-                return create_uni_prop_node(neg, name, unicode_bitmap_for(name), state);
+                if (!unicode_property_exists(name)) { set_error(state, REGEX_ERR_INVALID_PROP, "Unknown Unicode property"); free(name); return NULL; }
+                return create_uni_prop_node(neg, name, unicode_bitmap_for(state, name), state);
             }
             
             if (escaped == 'x' || escaped == 'u') {
@@ -1507,14 +1593,14 @@ RegexNode* parse_atom(ParserState *state) {
                         next_codepoint(state);
                         digits++;
                     }
-                    if (!match_codepoint(state, '}')) { set_error(state, "Unclosed hex escape"); return NULL; }
+                    if (!match_codepoint(state, '}')) { set_error(state, REGEX_ERR_INVALID_SYNTAX, "Unclosed hex escape"); return NULL; }
                     return create_char_node(code, state);
                 } else {
                     int num_digits = (escaped == 'x') ? 2 : 4;
                     for(int i = 0; i < num_digits; i++) {
                         uint32_t c = peek_codepoint(state);
                         int val = hexval(c);
-                        if (val == -1) { set_error(state, "Invalid hex escape sequence"); return NULL; }
+                        if (val == -1) { set_error(state, REGEX_ERR_INVALID_ESCAPE, "Invalid hex escape sequence"); return NULL; }
                         code = (code << 4) | val;
                         next_codepoint(state);
                     }
@@ -1525,7 +1611,7 @@ RegexNode* parse_atom(ParserState *state) {
             if (escaped == 'Q') {
                 int start = state->pos;
                 while (state->pattern[state->pos] && !(state->pattern[state->pos] == '\\' && state->pattern[state->pos+1] == 'E')) state->pos++;
-                if (state->pattern[state->pos] == '\0') { set_error(state, "Unclosed \\Q"); return NULL; }
+                if (state->pattern[state->pos] == '\0') { set_error(state, REGEX_ERR_INVALID_ESCAPE, "Unclosed \\Q"); return NULL; }
                 int end = state->pos;
                 state->pos += 2;
                 
@@ -1533,7 +1619,7 @@ RegexNode* parse_atom(ParserState *state) {
                 for (int i = start; i < end; ) {
                     uint32_t codepoint;
                     size_t len = utf8_decode(&state->pattern[i], &codepoint);
-                    if (len == 0) { set_error(state, "Invalid UTF-8 in \\Q...\\E"); return NULL; }
+                    if (len == 0) { set_error(state, REGEX_ERR_INVALID_UTF8, "Invalid UTF-8 in \\Q...\\E"); return NULL; }
                     i += len;
                     RegexNode *char_node = create_char_node(codepoint, state);
                     if (!char_node) return NULL;
@@ -1547,18 +1633,18 @@ RegexNode* parse_atom(ParserState *state) {
                 state->pos = atom_start_pos + 1; // back up
                 int ref_val = 0;
                 parse_number(state, &ref_val, 0);
-                if (ref_val > state->capture_count) { set_error(state, "Backreference to undefined group"); return NULL; }
+                if (ref_val > state->capture_count) { set_error(state, REGEX_ERR_INVALID_BACKREF, "Backreference to undefined group"); return NULL; }
                 return create_backref_node(ref_val, NULL, state);
             }
             
             if (escaped == 'k') {
-                if (!match_codepoint(state, '<')) { set_error(state, "Expected '<' after \\k"); return NULL; }
+                if (!match_codepoint(state, '<')) { set_error(state, REGEX_ERR_INVALID_SYNTAX, "Expected '<' after \\k"); return NULL; }
                 char *name = parse_group_name(state);
                 if (!name) return NULL;
                 
                 int group_index = find_named_group_index(state, name);
                 if (group_index == -1) {
-                    set_error(state, "Backreference to undefined named group");
+                    set_error(state, REGEX_ERR_INVALID_BACKREF, "Backreference to undefined named group");
                     free(name);
                     return NULL;
                 }
@@ -1571,7 +1657,7 @@ RegexNode* parse_atom(ParserState *state) {
             switch (escaped) {
                 case 'd': case 'D': case 's': case 'S': case 'w': case 'W': {
                     char *set_str = malloc(3);
-                    if (!set_str) { set_error(state, "Memory allocation failed"); return NULL; }
+                    if (!set_str) { set_error(state, REGEX_ERR_MEMORY, NULL); return NULL; }
                     sprintf(set_str, "\\%c", (char)escaped);
                     return create_char_class_node(set_str, false, false, state);
                 }
@@ -1596,12 +1682,12 @@ RegexNode* parse_atom(ParserState *state) {
             if (at_start || after_par || after_bar) {
                 return create_anchor_node('^', state);
             }
-            set_error(state, "Misplaced '^' anchor");
+            set_error(state, REGEX_ERR_INVALID_SYNTAX, "Misplaced '^' anchor");
             return NULL;
         case '$': return create_anchor_node('$', state);
         
         case ')': case '|': case '*': case '+': case '?': case '{': case '}':
-            set_error(state, "Unexpected special character");
+            set_error(state, REGEX_ERR_INVALID_SYNTAX, "Unexpected special character");
             return NULL;
             
         default:
@@ -1610,53 +1696,64 @@ RegexNode* parse_atom(ParserState *state) {
 }
 
 // ----------------------------------------------------------------------------
-// 13. AST Management (Freeing and Printing)
+// 15. AST Management (Freeing and Printing)
 // ----------------------------------------------------------------------------
 
-void free_regex_ast(RegexNode *node) {
+void free_regex_ast(RegexNode *node, const regex_allocator* allocator) {
     if (!node) return;
 
     // This function frees dynamically allocated string data within the AST.
     // The AST nodes themselves are in the arena and are freed all at once.
     switch (node->type) {
         case NODE_CHAR_CLASS:
-            if (node->data.char_class.set) free(node->data.char_class.set);
+            if (node->data.char_class.set) {
+                allocator->free_func(node->data.char_class.set, allocator->user_data);
+            }
             break;
         case NODE_UNI_PROP:
-            if (node->data.uni_prop.prop_name) free(node->data.uni_prop.prop_name);
+            if (node->data.uni_prop.prop_name) {
+                allocator->free_func(node->data.uni_prop.prop_name, allocator->user_data);
+            }
             break;
         case NODE_CONCAT:
         case NODE_ALTERNATION:
-            free_regex_ast(node->data.children.left);
-            free_regex_ast(node->data.children.right);
+            free_regex_ast(node->data.children.left, allocator);
+            free_regex_ast(node->data.children.right, allocator);
             break;
         case NODE_QUANTIFIER:
-            free_regex_ast(node->data.quantifier.child);
+            free_regex_ast(node->data.quantifier.child, allocator);
             break;
         case NODE_GROUP:
         case NODE_BRESET_GROUP:
-            if (node->data.group.name) free(node->data.group.name);
-            free_regex_ast(node->data.group.child);
+            if (node->data.group.name) {
+                allocator->free_func(node->data.group.name, allocator->user_data);
+            }
+            free_regex_ast(node->data.group.child, allocator);
             break;
         case NODE_BACKREF:
-            if (node->data.backref.ref_name) free(node->data.backref.ref_name);
+            if (node->data.backref.ref_name) {
+                allocator->free_func(node->data.backref.ref_name, allocator->user_data);
+            }
             break;
         case NODE_ASSERTION:
-            free_regex_ast(node->data.assertion.child);
+            free_regex_ast(node->data.assertion.child, allocator);
             break;
         case NODE_CONDITIONAL:
             if (node->data.conditional.cond.type == COND_NAMED && node->data.conditional.cond.data.group_name) {
-                free(node->data.conditional.cond.data.group_name);
+                allocator->free_func(node->data.conditional.cond.data.group_name, allocator->user_data);
             } else if (node->data.conditional.cond.type == COND_ASSERTION) {
-                free_regex_ast(node->data.conditional.cond.data.assertion);
+                free_regex_ast(node->data.conditional.cond.data.assertion, allocator);
             }
-            free_regex_ast(node->data.conditional.if_true);
-            free_regex_ast(node->data.conditional.if_false);
+            free_regex_ast(node->data.conditional.if_true, allocator);
+            free_regex_ast(node->data.conditional.if_false, allocator);
             break;
         case NODE_SUBROUTINE:
-            if (node->data.subroutine.target_name) free(node->data.subroutine.target_name);
+            if (node->data.subroutine.target_name) {
+                allocator->free_func(node->data.subroutine.target_name, allocator->user_data);
+            }
             break;
-        default: break;
+        default:
+            break;
     }
 }
 
@@ -1696,7 +1793,7 @@ void print_regex_ast_recursive(const RegexNode *node, int indent) {
             print_regex_ast_recursive(node->data.children.right, indent + 1);
             break;
         case NODE_QUANTIFIER: {
-            const char *q_type;
+            const char *q_type = "unknown";
             switch (node->data.quantifier.quant_type) {
                 case QUANT_GREEDY: q_type = "greedy"; break;
                 case QUANT_LAZY: q_type = "lazy"; break;
@@ -1780,87 +1877,214 @@ void print_regex_ast(const RegexNode *root) {
 }
 
 // ----------------------------------------------------------------------------
-// 14. Main Entry Point and Cleanup
+// 16. Main Entry Point and Cleanup
 // ----------------------------------------------------------------------------
 
 // A single function to free all resources related to a parse state.
 void free_parser_state_resources(ParserState* state) {
-    if (state->arena) {
-        arena_free(state->arena);
-        free(state->arena);
-        state->arena = NULL;
-    }
+    if (!state->arena) return;
+    
+    const regex_allocator* allocator = &state->arena->allocator;
+    
     for (int i = 0; i < state->fixup_count; i++) {
-        free(state->fixups[i].name);
+        if (state->fixups[i].name) {
+            allocator->free_func(state->fixups[i].name, allocator->user_data);
+        }
     }
-    free(state->fixups);
+    if (state->fixups) allocator->free_func(state->fixups, allocator->user_data);
     state->fixups = NULL;
+    
     for (int i = 0; i < state->named_group_count; i++) {
-        free(state->named_groups[i]);
+        if (state->named_groups[i]) {
+            allocator->free_func(state->named_groups[i], allocator->user_data);
+        }
     }
-    free(state->named_groups);
+    if (state->named_groups) allocator->free_func(state->named_groups, allocator->user_data);
     state->named_groups = NULL;
+    
+    arena_free(state->arena);
+    allocator->free_func(state->arena, allocator->user_data);
+    state->arena = NULL;
 }
 
-// Main parsing function. On success, it returns the AST root and sets out_arena.
-// The caller is responsible for freeing the result with regex_free_result.
-// On failure, it returns NULL, sets error_msg, and cleans up all resources.
-RegexNode* regex_parse(const char* pattern, unsigned compile_flags, AstArena** out_arena, char** error_msg) {
-    *error_msg = NULL;
+static RegexNode* regex_parse_internal(
+    const char* pattern,
+    uint32_t flags,
+    const regex_allocator* allocator,
+    AstArena** out_arena,
+    int* out_capture_count,
+    regex_err* error)
+{
     *out_arena = NULL;
+    *out_capture_count = 0;
+    memset(error, 0, sizeof(*error));
 
-    AstArena* arena = malloc(sizeof(AstArena));
-    if (!arena) { *error_msg = strdup("Failed to allocate memory for arena"); return NULL; }
+    AstArena* arena = allocator->malloc_func(sizeof(AstArena), allocator->user_data);
+    if (!arena) {
+        error->code = REGEX_ERR_MEMORY;
+        error->msg = regex_error_message(REGEX_ERR_MEMORY);
+        return NULL;
+    }
     memset(arena, 0, sizeof(AstArena));
+    arena->allocator = *allocator;
 
-    ParserState state = { .pattern = pattern, .arena = arena, .compile_flags = compile_flags, .in_conditional = false };
-    if (compile_flags & REG_IGNORECASE) state.flags |= REG_IGNORECASE;
-    if (compile_flags & REG_MULTILINE)  state.flags |= REG_MULTILINE;
-    if (compile_flags & REG_SINGLELINE) state.flags |= REG_SINGLELINE;
-    if (compile_flags & REG_EXTENDED)   state.flags |= REG_EXTENDED;
-    if (compile_flags & REG_UNGREEDY)   state.flags |= REG_UNGREEDY;
+    ParserState state = {
+        .pattern = pattern,
+        .arena = arena,
+        .compile_flags = flags,
+        .in_conditional = false
+    };
+    if (flags & REG_IGNORECASE) state.flags |= REG_IGNORECASE;
+    if (flags & REG_MULTILINE)  state.flags |= REG_MULTILINE;
+    if (flags & REG_SINGLELINE) state.flags |= REG_SINGLELINE;
+    if (flags & REG_EXTENDED)   state.flags |= REG_EXTENDED;
+    if (flags & REG_UNGREEDY)   state.flags |= REG_UNGREEDY;
 
     RegexNode* root = parse_regex(&state);
 
-    if (!state.has_error) process_fixups(&state);
+    if (!state.has_error) {
+        process_fixups(&state);
+    }
 
     if (state.has_error) {
-        *error_msg = strdup(state.error_msg);
-        free_regex_ast(root); // Free malloc'd strings
-        free_parser_state_resources(&state);
-        return NULL;
-    } else if (peek_codepoint(&state) != 0) {
-        set_error(&state, "Unexpected characters at end of pattern");
-        *error_msg = strdup(state.error_msg);
-        free_regex_ast(root);
+        *error = state.error;
         free_parser_state_resources(&state);
         return NULL;
     }
-    
-    // Success: transfer ownership of the arena to the caller.
-    *out_arena = arena;
 
-    // Free temporary lists that are not part of the AST result.
-    for (int i = 0; i < state.fixup_count; i++) free(state.fixups[i].name);
-    free(state.fixups);
-    for (int i = 0; i < state.named_group_count; i++) free(state.named_groups[i]);
-    free(state.named_groups);
+    if (peek_codepoint(&state) != 0) {
+        set_error(&state, REGEX_ERR_INVALID_SYNTAX, "Unexpected characters at end of pattern");
+        *error = state.error;
+        free_parser_state_resources(&state);
+        return NULL;
+    }
+
+    // Success
+    *out_arena = arena;
+    *out_capture_count = state.capture_count;
+
+    // Free temporary lists used only during parsing
+    for (int i = 0; i < state.fixup_count; i++) {
+        allocator->free_func(state.fixups[i].name, allocator->user_data);
+    }
+    if (state.fixups) allocator->free_func(state.fixups, allocator->user_data);
+    for (int i = 0; i < state.named_group_count; i++) {
+        allocator->free_func(state.named_groups[i], allocator->user_data);
+    }
+    if (state.named_groups) allocator->free_func(state.named_groups, allocator->user_data);
 
     return root;
 }
 
-// User-facing cleanup function.
-void regex_free_result(RegexNode *root, AstArena *arena) {
-    if (!arena) return;
-    free_regex_ast(root); // Frees malloc'd strings from nodes
-    arena_free(arena);    // Frees the memory blocks holding nodes
-    free(arena);          // Frees the arena struct itself
+// ----------------------------------------------------------------------------
+// 17. New Public API Implementation
+// ----------------------------------------------------------------------------
+
+regex_compiled* regex_compile_with_allocator(
+    const char* pattern,
+    uint32_t flags,
+    const regex_allocator* allocator,
+    regex_err* error)
+{
+    regex_err local_error;
+    if (!error) {
+        error = &local_error;
+    }
+
+    if (!pattern || !allocator) {
+        error->code = REGEX_ERR_INVALID_SYNTAX;
+        error->msg = "Invalid parameters: pattern and allocator must not be NULL";
+        return NULL;
+    }
+
+    regex_compiled* rx = allocator->malloc_func(sizeof(regex_compiled), allocator->user_data);
+    if (!rx) {
+        error->code = REGEX_ERR_MEMORY;
+        error->msg = regex_error_message(REGEX_ERR_MEMORY);
+        return NULL;
+    }
+    memset(rx, 0, sizeof(*rx));
+    rx->allocator = *allocator;
+    rx->flags = flags;
+
+    rx->ast = regex_parse_internal(pattern, flags, allocator, &rx->arena, &rx->capture_count, error);
+
+    if (!rx->ast) {
+        allocator->free_func(rx, allocator->user_data);
+        return NULL;
+    }
+
+    return rx;
 }
 
+regex_compiled* regex_compile(const char* pattern, uint32_t flags, regex_err* error) {
+    return regex_compile_with_allocator(pattern, flags, &default_allocator, error);
+}
+
+void regex_free(regex_compiled* rx) {
+    if (!rx) return;
+
+    regex_allocator allocator = rx->allocator;
+
+    if (rx->ast && rx->arena) {
+        free_regex_ast(rx->ast, &allocator);
+        arena_free(rx->arena);
+        allocator.free_func(rx->arena, allocator.user_data);
+    }
+
+    allocator.free_func(rx, allocator.user_data);
+}
+
+int regex_match(regex_compiled* rx, const char* subject, size_t subject_len, regex_match_result* result) {
+    (void)rx;
+    (void)subject;
+    (void)subject_len;
+    (void)result;
+    return 0;
+}
+
+void regex_free_match_result(regex_match_result* result, const regex_allocator* alloc) {
+    if (!result) return;
+    const regex_allocator* allocator = alloc ? alloc : &default_allocator;
+    if (result->capture_starts) allocator->free_func(result->capture_starts, allocator->user_data);
+    if (result->capture_ends) allocator->free_func(result->capture_ends, allocator->user_data);
+}
+
+// ----------------------------------------------------------------------------
+// 18. Legacy API for Backward Compatibility
+// ----------------------------------------------------------------------------
+
+RegexNode* regex_parse(const char* pattern, unsigned compile_flags, AstArena** out_arena, char** error_msg) {
+    regex_err error;
+    int capture_count;
+
+    RegexNode* result = regex_parse_internal(pattern, compile_flags, &default_allocator, out_arena, &capture_count, &error);
+
+    if (error_msg) {
+        if (error.code != REGEX_OK) {
+            char buffer[256];
+            snprintf(buffer, sizeof(buffer), "Error at line %d, column %d: %s",
+                     error.line, error.col, error.msg);
+            *error_msg = strdup(buffer);
+        } else {
+            *error_msg = NULL;
+        }
+    }
+
+    return result;
+}
+
+void regex_free_result(RegexNode *root, AstArena *arena) {
+    if (!arena) return;
+    free_regex_ast(root, &default_allocator);
+    arena->allocator = default_allocator;
+    arena_free(arena);
+    free(arena);
+}
 #ifdef TEST_MAIN
 
 // ----------------------------------------------------------------------------
-// 15. Test Harness
+// 19. Test Harness
 // ----------------------------------------------------------------------------
 // Global test counters
 static int total_tests = 0;
