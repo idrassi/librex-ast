@@ -2035,14 +2035,6 @@ void regex_free(regex_compiled* rx) {
     allocator.free_func(rx, allocator.user_data);
 }
 
-int regex_match(regex_compiled* rx, const char* subject, size_t subject_len, regex_match_result* result) {
-    (void)rx;
-    (void)subject;
-    (void)subject_len;
-    (void)result;
-    return 0;
-}
-
 void regex_free_match_result(regex_match_result* result, const regex_allocator* alloc) {
     if (!result) return;
     const regex_allocator* allocator = alloc ? alloc : &default_allocator;
@@ -2089,6 +2081,26 @@ void regex_free_result(RegexNode *root, AstArena *arena) {
 // Global test counters
 static int total_tests = 0;
 static int total_failures = 0;
+
+int test_match(void) {
+    regex_err e;
+    regex_compiled *rx = regex_compile("a([0-9]+)b(?:foo)?bar", REG_EXTENDED, &e);
+    if (!rx) { printf("compile error: %s\n", e.msg); return 1; }
+
+    regex_match_result res = {0};
+    const char *text = "a123bbarxxx";
+    if (regex_match(rx, text, strlen(text), &res) > 0) {
+        printf("match [%d,%d]\n", res.match_start, res.match_end);
+        printf("group1 [%d,%d]\n", *res.capture_starts, *res.capture_ends);
+        regex_free_match_result(&res, NULL);
+    }
+    else {
+        printf("no match\n");
+    }
+    regex_free(rx);
+    regex_cleanup_property_cache();
+    return 0;
+}
 
 // Test helper function for the new enhanced parser
 void test_pattern(const char* pattern, bool expected_success, unsigned flags) {
@@ -2243,6 +2255,8 @@ int main(void) {
 
     // Cleanup before exit
     regex_cleanup_property_cache();
+
+    test_match();
 
     return total_failures;
 }
