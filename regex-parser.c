@@ -2098,11 +2098,10 @@ void test_pattern(const char* pattern, bool expected_success, unsigned flags) {
     printf("Expected: %s\n", expected_success ? "SUCCESS" : "FAILURE");
     printf("----------------------------------------------------\n");
 
-    char* error_msg = NULL;
-    AstArena* arena = NULL;
-    RegexNode* ast = regex_parse(pattern, flags, &arena, &error_msg);
-    
-    bool actual_success = (ast != NULL && error_msg == NULL);
+    regex_err error = {0};
+    regex_compiled* rx = regex_compile(pattern, flags, &error);
+
+    bool actual_success = (rx != NULL && error.code == REGEX_OK);
 
     if (actual_success != expected_success) {
         total_failures++;
@@ -2110,20 +2109,24 @@ void test_pattern(const char* pattern, bool expected_success, unsigned flags) {
         if (actual_success) {
             printf("   (Expected failure, but got success)\n");
             printf("   AST:\n");
-            print_regex_ast(ast);
+            print_regex_ast(rx->ast);
         } else {
             printf("   (Expected success, but got failure)\n");
-            printf("   Error: %s\n", error_msg ? error_msg : "(unknown error)");
+            printf("   Error: ");
+            if (error.code != REGEX_OK) {
+                printf("Error at line %d, column %d: %s\n", error.line, error.col, error.msg ? error.msg : "(unknown error)");
+            } else {
+                printf("(unknown error)\n");
+            }
         }
     } else {
         printf(">> TEST RESULT: PASS <<\n");
     }
 
-    regex_free_result(ast, arena);
-
-    if (error_msg) {
-        free(error_msg);
+    if (rx) {
+        regex_free(rx);
     }
+
     printf("\n");
 }
 

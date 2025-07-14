@@ -137,6 +137,8 @@ int regex_match(
 // Free a match result object.
 void regex_free_match_result(regex_match_result* result, const regex_allocator* allocator);
 
+// Cleanup function for internal Unicode property cache
+void regex_cleanup_property_cache(void);
 
 // --- Utility Functions ---
 
@@ -155,9 +157,6 @@ typedef struct AstArena AstArena;
 
 // Print the AST for debugging purposes
 void print_regex_ast(const RegexNode* node);
-
-// Cleanup function for internal Unicode property cache
-void regex_cleanup_property_cache(void);
 
 // --- Deprecated legacy API (for backward compatibility) ---
 RegexNode* regex_parse(const char *pattern, uint32_t flags, AstArena **arena, char **error_msg);
