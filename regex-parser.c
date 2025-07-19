@@ -265,6 +265,11 @@ typedef struct {
     char *name;
 } Fixup;
 
+typedef struct {
+    char* name;
+    int index;
+} NamedGroup;
+
 // Parser state
 typedef struct {
     const char *pattern;
@@ -274,7 +279,7 @@ typedef struct {
     bool has_error;
     int line_number;
     int column_start;
-    char **named_groups;
+    NamedGroup *named_groups;
     int named_group_count;
     int named_group_capacity;
     uint32_t flags;
@@ -567,8 +572,8 @@ static void add_fixup(ParserState *state, RegexNode *node, char *name) {
 
 static int find_named_group_index(ParserState *state, const char *name) {
     for (int i = 0; i < state->named_group_count; i++) {
-        if (strcmp(state->named_groups[i], name) == 0) {
-            return i + 1; // Return 1-based index
+        if (strcmp(state->named_groups[i].name, name) == 0) {
+            return state->named_groups[i].index;
         }
     }
     return -1;
@@ -600,9 +605,9 @@ static void process_fixups(ParserState *state) {
 // 10. Named group management
 // ----------------------------------------------------------------------------
 
-static bool add_named_group(ParserState *state, const char *name) {
+static bool add_named_group(ParserState *state, const char *name, int capture_index) {
     for (int i = 0; i < state->named_group_count; i++) {
-        if (strcmp(state->named_groups[i], name) == 0) {
+        if (strcmp(state->named_groups[i].name, name) == 0) {
             set_error(state, REGEX_ERR_DUPLICATE_NAME, NULL);
             return false;
         }
@@ -610,8 +615,8 @@ static bool add_named_group(ParserState *state, const char *name) {
 
     if (state->named_group_count >= state->named_group_capacity) {
         state->named_group_capacity = state->named_group_capacity > 0 ? state->named_group_capacity * 2 : 8;
-        char **new_groups = state->arena->allocator.realloc_func(
-            state->named_groups, state->named_group_capacity * sizeof(char*), state->arena->allocator.user_data);
+        NamedGroup *new_groups = state->arena->allocator.realloc_func(
+            state->named_groups, state->named_group_capacity * sizeof(NamedGroup), state->arena->allocator.user_data);
         if (!new_groups) {
             set_error(state, REGEX_ERR_MEMORY, NULL);
             return false;
@@ -619,11 +624,12 @@ static bool add_named_group(ParserState *state, const char *name) {
         state->named_groups = new_groups;
     }
     
-    state->named_groups[state->named_group_count] = pstrdup(state, name);
-    if (!state->named_groups[state->named_group_count]) {
+    state->named_groups[state->named_group_count].name = pstrdup(state, name);
+    if (!state->named_groups[state->named_group_count].name) {
         set_error(state, REGEX_ERR_MEMORY, NULL);
         return false;
     }
+    state->named_groups[state->named_group_count].index = capture_index;
     state->named_group_count++;
     return true;
 }
@@ -1228,6 +1234,7 @@ RegexNode* parse_atom(ParserState *state) {
                 AssertionType assert_type = 0;
                 char *name = NULL;
                 uint32_t old_flags = state->flags;
+                int capture_index = -1;
 
                 uint32_t next_c = peek_codepoint(state);
                 switch (next_c) {
@@ -1248,7 +1255,8 @@ RegexNode* parse_atom(ParserState *state) {
                         else {
                             name = parse_group_name(state);
                             if (!name) return NULL;
-                            if (!add_named_group(state, name)) { free(name); return NULL; }
+                            capture_index = ++state->capture_count;
+                            if (!add_named_group(state, name, capture_index)) { free(name); return NULL; }
                         }
                         break;
                     }
@@ -1298,8 +1306,7 @@ RegexNode* parse_atom(ParserState *state) {
                     }
                 }
                 // Common logic for groups parsed above
-                int capture_index = -1;
-                if (!is_assertion && !non_capturing && !is_atomic) {
+                if (!is_assertion && !non_capturing && !is_atomic && !name) { // !name: skip increment for named groups since it was already done
                     capture_index = ++state->capture_count;
                 }
                 RegexNode *sub_expr = parse_regex(state);
@@ -1678,11 +1685,11 @@ void free_parser_state_resources(ParserState* state) {
     state->fixups = NULL;
     
     for (int i = 0; i < state->named_group_count; i++) {
-        if (state->named_groups[i]) {
-            allocator->free_func(state->named_groups[i], allocator->user_data);
+        if (state->named_groups[i].name) {
+            state->arena->allocator.free_func(state->named_groups[i].name, state->arena->allocator.user_data);
         }
     }
-    if (state->named_groups) allocator->free_func(state->named_groups, allocator->user_data);
+    if (state->named_groups) state->arena->allocator.free_func(state->named_groups, state->arena->allocator.user_data);
     state->named_groups = NULL;
     
     arena_free(state->arena);
@@ -1803,9 +1810,11 @@ static RegexNode* regex_parse_internal(
     }
     if (state.fixups) allocator->free_func(state.fixups, allocator->user_data);
     for (int i = 0; i < state.named_group_count; i++) {
-        allocator->free_func(state.named_groups[i], allocator->user_data);
+        if (state.named_groups[i].name) {
+            state.arena->allocator.free_func(state.named_groups[i].name, state.arena->allocator.user_data);
+        }
     }
-    if (state.named_groups) allocator->free_func(state.named_groups, allocator->user_data);
+    if (state.named_groups) state.arena->allocator.free_func(state.named_groups, state.arena->allocator.user_data);
 
     return root;
 }

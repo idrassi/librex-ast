@@ -237,6 +237,20 @@ static void cleanup_codebuf_subroutines(CodeBuf *b) {
     }
 }
 
+static int find_group_index_by_name(CodeBuf *b, const char *group_name) {
+    if (!group_name) {
+        return -1;
+    }
+    // Search the recorded subroutine/group definitions for the name.
+    for (int i = 0; i < b->subroutines.count; i++) {
+        SubroutineDef *def = &b->subroutines.defs[i];
+        if (def->group_name && strcmp(def->group_name, group_name) == 0) {
+            return def->group_index;
+        }
+    }
+    return -1; // Not found
+}
+
 static size_t find_subroutine_pc(CodeBuf *b, int group_index, char *group_name) {
     // First check named groups
     if (group_name) {
@@ -403,12 +417,26 @@ static size_t compile_assertion(CodeBuf *b, RegexNode *n, bool ic, bool dotnl, b
 
 static size_t compile_conditional(CodeBuf *b, RegexNode *n, bool ic, bool dotnl, bool multiline) {
     if (b->oom) return 0;
-    
+
     Condition *c = &n->data.conditional.cond;
 
-    if (c->type == COND_NUMERIC) {
+    if (c->type == COND_NUMERIC || c->type == COND_NAMED) {
+        int group_index;
+        if (c->type == COND_NAMED) {
+            group_index = find_group_index_by_name(b, c->data.group_name);
+        } else {
+            group_index = c->data.group_index;
+        }
+
+        // The parser should ensure the group exists. If the name can't be resolved at
+        // compile time (e.g., a forward reference not supported by the parser),
+        // we fall back to a simple alternation.
+        if (group_index <= 0) {
+            goto fallback_alternation;
+        }
+
         size_t gcond_addr = b->pc;
-        emit(b, (Instr){.op = I_GCOND, .val = (uintptr_t)c->data.group_index, .x = 0, .y = 0});
+        emit(b, (Instr){.op = I_GCOND, .val = (uintptr_t)group_index, .x = 0, .y = 0});
 
         // "yes" branch
         size_t yes_start = b->pc;
@@ -481,7 +509,7 @@ static size_t compile_conditional(CodeBuf *b, RegexNode *n, bool ic, bool dotnl,
     }
 
 fallback_alternation:;
-    // Fallback for unsupported conditions (e.g., named groups)
+    // Fallback for unsupported or unresolvable conditions.
     size_t split_addr = b->pc;
     emit(b, (Instr){.op = I_SPLIT, .x = 0, .y = 0});
 
