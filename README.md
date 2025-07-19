@@ -2,19 +2,18 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**librex-ast** is a feature-rich, PCRE/Perl-compatible regular expression parser written in modern C.
+**librex-ast** is a feature-rich, PCRE2-compatible regular expression engine written in modern C. It provides a complete pipeline for compiling regex patterns into an efficient internal bytecode representation and executing them against subject strings using a backtracking NFA-style virtual machine.
 
-Unlike regex *engines* that match text, `librex-ast` is a **parser**. It takes a regex pattern as input and produces a detailed **Abstract Syntax Tree (AST)** that represents its logical structure. This makes it an ideal foundation for building custom regex engines, compilers, transpilers, static analysis tools, or educational software.
+Originally an AST parser, the library has evolved into a complete engine designed for correctness, feature-completeness, and PCRE2 compatibility. It serves as an excellent foundation for building custom tools, educational software, or for anyone interested in the internals of modern regex engines.
 
 ---
 
-### ⚠️ Project Status: Educational & Experimental
+### ⚠️ Project Status: Advanced & Experimental
 
-This library is a comprehensive implementation of modern regex syntax and is an excellent resource for learning about parsing techniques. However, before using it in a production environment, please be aware of the following:
+This library is a comprehensive implementation of a modern regex engine, capable of passing a large compatibility test suite. However, before using it in a production environment, please be aware of the following:
 
-*   **Not Thread-Safe:** The current implementation uses a global cache for Unicode properties, making it unsafe for concurrent use across multiple threads.
-*   **Simplified Unicode Properties:** The `\p{...}` property support is framework-ready but uses a simplified, non-exhaustive set of Unicode data for demonstration. A production-ready version would require data generated from the full Unicode Character Database (UCD).
-*   **API Ergonomics:** The API is fully functional but exposes internal memory management details (the `AstArena`). A future version will hide this behind an opaque handle for a cleaner user experience.
+*   **Not Yet Performance-Tuned:** The VM implementation is focused on correctness and feature support. It has not yet been optimized for high-throughput production workloads and may be significantly slower than mature libraries like PCRE2.
+*   **Simplified Unicode Properties:** The `\p{...}` property support is comprehensive but uses a simplified, non-exhaustive set of Unicode data. A production-ready version would require data generated from the full Unicode Character Database (UCD).
 
 Contributions to address these points are highly welcome!
 
@@ -22,21 +21,33 @@ Contributions to address these points are highly welcome!
 
 ### Key Features
 
-*   **Extensive PCRE/Perl Syntax Support:** Parses a wide array of constructs beyond basic regex.
-*   **Detailed AST:** Generates a clean, navigable Abstract Syntax Tree for deep pattern analysis.
-*   **Advanced Grouping:** Full support for named/numbered capture groups, atomic groups (`(?>...)`), branch-reset groups (`(?|...)`), and more.
-*   **Assertions & Conditionals:** Correctly parses lookaheads, lookbehinds, and conditional subpatterns (`(?(cond)...)`).
-*   **Subroutines & Recursion:** Handles subroutine calls (`(?1)`, `(?&name)`) and full pattern recursion (`(?R)`).
-*   **Unicode-Aware:** Parses UTF-8 patterns, Unicode escape sequences (`\x{...}`), and Unicode properties (`\p{L}`).
-*   **Efficient Memory Management:** Uses an arena allocator for fast, bulk allocation of AST nodes, minimizing `malloc` overhead.
-*   **Comprehensive Error Reporting:** Provides clear, human-readable error messages with line and column numbers.
-*   **Zero Dependencies:** Written in pure C11 with no external library dependencies.
+*   **PCRE2-Compatible Engine:** A complete engine that compiles patterns and matches strings, not just a parser.
+*   **Two-Stage Compilation:**
+    1.  **Parser:** A robust recursive-descent parser builds a detailed Abstract Syntax Tree (AST) from the pattern.
+    2.  **Compiler:** The AST is then compiled into a compact and efficient bytecode format.
+*   **Backtracking NFA Virtual Machine:** The engine uses a custom VM to execute the bytecode, providing powerful and correct matching behavior.
+*   **Extensive Syntax Support:** Implements a wide array of PCRE2/Perl constructs, including advanced assertions, conditionals, and subroutines.
+*   **Structured Error Reporting:** The compile function provides a detailed `regex_err` object with an error code, message, and the exact position of the error in the pattern.
+*   **Pluggable Memory Allocators:** The entire library can be configured to use custom `malloc`, `realloc`, and `free` functions for specialized memory environments.
+*   **Clean, Opaque API:** The compiled pattern is managed through an opaque `regex_compiled*` handle, hiding internal complexity.
+*   **Unicode-Aware:** Correctly parses UTF-8 patterns, Unicode escape sequences (`\x{...}`), and Unicode properties (`\p{L}`).
+*   **Zero Dependencies:** Written in pure C99 with no external library dependencies.
+
+---
+
+### Architecture Overview
+
+The engine operates in three distinct stages:
+
+1.  **Parsing (`regex-parser.c`)**: The input pattern string is parsed into an Abstract Syntax Tree (AST). This tree represents the logical structure of the regular expression. This stage validates syntax and reports errors.
+2.  **Compilation (`regex-match.c`)**: The AST is traversed by a compiler which emits a linear sequence of bytecode instructions. This bytecode is a low-level representation of the matching logic, optimized for the VM.
+3.  **Execution (`regex-match.c`)**: The generated bytecode is executed by a lightweight, stack-based virtual machine (VM). The VM performs the actual matching against the subject string using a backtracking NFA algorithm.
 
 ---
 
 ### Usage Example
 
-Here is a simple example of how to parse a pattern and print its AST.
+Here is a simple example of how to compile a pattern, execute a match, and inspect the results.
 
 ```c
 #include <stdio.h>
@@ -45,28 +56,51 @@ Here is a simple example of how to parse a pattern and print its AST.
 
 int main(void) {
     const char* pattern = "(?<year>\\d{4})-(?<month>\\d{2})-(?<day>\\d{2})";
-    char* error_msg = NULL;
-    AstArena* arena = NULL;
+    const char* subject = "The date is 2023-11-28.";
 
-    // Parse the regular expression
-    RegexNode* ast = regex_parse(pattern, 0, &arena, &error_msg);
+    regex_err error = {0};
+    
+    // 1. Compile the pattern
+    regex_compiled* rx = regex_compile(pattern, 0, &error);
 
-    if (ast) {
-        printf("Successfully parsed pattern: \"%s\"\n", pattern);
-        printf("--- AST ---\n");
-        print_regex_ast(ast);
-        printf("-----------\n");
-
-        // Clean up the AST and the arena
-        regex_free_result(ast, arena);
-    } else {
-        fprintf(stderr, "Failed to parse pattern.\n");
-        fprintf(stderr, "Error: %s\n", error_msg);
-        free(error_msg); // The error message is malloc'd
+    if (!rx) {
+        fprintf(stderr, "Failed to compile pattern at position %d: %s\n", 
+                error.pos, error.msg);
+        return 1;
     }
     
-    // Recommended cleanup for global caches
-    regex_cleanup_property_cache();
+    printf("Successfully compiled pattern: \"%s\"\n", pattern);
+
+    // 2. Execute the match
+    regex_match_result result = {0};
+    int match_status = regex_match(rx, subject, strlen(subject), &result);
+
+    if (match_status > 0) {
+        printf("Match found from index %d to %d!\n", result.match_start, result.match_end);
+        printf("  - Full match: '%.*s'\n", 
+               (result.match_end - result.match_start), 
+               subject + result.match_start);
+
+        for (int i = 0; i < result.capture_count; i++) {
+            if (result.capture_starts[i] != -1) {
+                printf("  - Group %d: '%.*s'\n", i + 1,
+                       (result.capture_ends[i] - result.capture_starts[i]),
+                       subject + result.capture_starts[i]);
+            }
+        }
+        
+        // 3. Free the match result
+        regex_free_match_result(&result, NULL);
+
+    } else if (match_status == 0) {
+        printf("No match found.\n");
+    } else {
+        // A negative return value from regex_match is an execution error
+        fprintf(stderr, "Execution error: %s\n", regex_error_message(-match_status));
+    }
+
+    // 4. Free the compiled regex object
+    regex_free(rx);
 
     return 0;
 }
@@ -74,27 +108,58 @@ int main(void) {
 
 ### API Reference
 
-*   `RegexNode* regex_parse(const char* pattern, uint32_t flags, AstArena** arena, char** error_msg)`
-    Parses a null-terminated `pattern` string. On success, returns the root `RegexNode` of the AST and populates `*arena`. On failure, returns `NULL` and allocates an error message in `*error_msg`. The caller is responsible for freeing `error_msg`.
+#### Core Structures
 
-*   `void regex_free_result(RegexNode* node, AstArena* arena)`
-    Frees all memory associated with a successful parse result, including the AST nodes and the arena itself.
+*   `regex_compiled`: An opaque pointer representing a compiled regular expression.
+*   `regex_err`: A struct containing detailed error information (`code`, `pos`, `line`, `col`, `msg`).
+*   `regex_match_result`: A struct containing the results of a successful match, including overall match bounds and an array of capture group bounds.
+*   `regex_allocator`: A struct allowing you to provide custom memory allocation functions.
 
-*   `void print_regex_ast(const RegexNode* node)`
-    A debugging utility to print a human-readable representation of the AST to standard output.
+#### Main Functions
 
-*   `void regex_cleanup_property_cache(void)`
-    Frees memory used by the global Unicode property cache.
+*   `regex_compiled* regex_compile(const char* pattern, uint32_t flags, regex_err* error)`
+    Compiles a null-terminated `pattern` string using standard library allocators. On success, returns an opaque `regex_compiled*` handle. On failure, returns `NULL` and populates the `error` struct.
 
-*   **Flags:** `REG_IGNORECASE`, `REG_MULTILINE`, `REG_SINGLELINE`, `REG_EXTENDED`, `REG_UNGREEDY`.
+*   `regex_compiled* regex_compile_with_allocator(...)`
+    Same as `regex_compile` but uses a custom `regex_allocator`.
+
+*   `void regex_free(regex_compiled* rx)`
+    Frees all memory associated with a compiled regex handle.
+
+*   `int regex_match(regex_compiled* rx, const char* subject, size_t subject_len, regex_match_result* result)`
+    Executes a compiled regex `rx` against a `subject` string.
+    *   Returns `1` on a successful match and populates the `result` struct.
+    *   Returns `0` if no match is found.
+    *   Returns a negative `REGEX_ERR_*` code on a runtime error (e.g., recursion limit).
+
+*   `void regex_free_match_result(regex_match_result* result, const regex_allocator* allocator)`
+    Frees the capture group arrays within a `regex_match_result` struct. Pass `NULL` for the allocator to use the standard library `free`.
+
+#### Utility Functions
+
+*   `const char* regex_error_message(int error_code)`
+    Returns a static, human-readable string for a given `REGEX_ERR_*` code.
+
+*   `void print_regex_ast(const regex_compiled* rx)`
+    A debugging utility to print a human-readable representation of the internal AST to standard output.
+
+#### Compilation Flags
+
+*   `REG_IGNORECASE`: Perform case-insensitive matching.
+*   `REG_MULTILINE`: `^` and `$` match the start/end of lines, not just the start/end of the string.
+*   `REG_SINGLELINE`: `.` (dot) metacharacter matches all characters, including newlines.
+*   `REG_EXTENDED`: Ignore unescaped whitespace and comments starting with `#`.
+*   `REG_UNGREEDY`: Invert the greediness of quantifiers (e.g., `*` becomes lazy, `*?` becomes greedy).
 
 ---
 
 ### Supported Regex Syntax
 
+The engine supports a wide subset of PCRE2/Perl syntax.
+
 #### Basic Elements
-- Literal characters (including full Unicode support)
-- `.` (dot metacharacter)
+- Literal characters (full Unicode support)
+- `.` (dot metacharacter, respects `REG_SINGLELINE`)
 - Character classes `[abc]`, `[^abc]`, `[a-z]`
 - Pre-defined classes: `\d`, `\D`, `\w`, `\W`, `\s`, `\S`
 - Anchors: `^`, `$`, `\A`, `\z`, `\b` (word boundary), `\B`
@@ -107,7 +172,7 @@ int main(void) {
 #### Groups
 - Capturing groups: `(...)`
 - Non-capturing groups: `(?:...)`
-- Named groups: `(?<name>...)`
+- Named capturing groups: `(?<name>...)`
 - Atomic groups: `(?>...)`
 - Branch-reset groups: `(?|...)`
 
@@ -118,59 +183,59 @@ int main(void) {
 - Negative Lookbehind: `(?<!...)` (fixed-length only)
 
 #### Backreferences & Subroutines
-- Numbered backreferences: `\1`, `\2`
+- Numbered backreferences: `\1`, `\2`, etc.
 - Named backreferences: `\k<name>`
-- Numbered subroutine calls: `(?1)`, `(?2)`
+- Numbered subroutine calls: `(?1)`, `(?2)`, etc.
+al
 - Named subroutine calls: `(?&name)`
 - Full pattern recursion: `(?R)`
 
 #### Conditionals
 - Numeric condition: `(?(1)yes|no)`
 - Named condition: `(?(<name>)yes|no)`
-- Assertion condition: `(?((?=...))yes|no)`
+- Assertion condition: `(?(?=...)yes|no)`
 
 #### Modifiers & Unicode
 - Inline flags: `(?i)`, `(?-m)`
 - Scoped flags: `(?i:...)`
 - Unicode properties: `\p{L}`, `\P{Sc}`
-- Unicode escapes: `\x{1F600}`
+- Unicode escapes: `\x{...}`, `\u....`
+- POSIX character classes: `[[:alpha:]]`, `[[:digit:]]`, etc.
 
 #### Other
 - Comments: `(?#...)`
 - Quoted sequences: `\Q...\E`
-- POSIX character classes: `[[:alpha:]]`, `[[:digit:]]`, etc.
 
 ---
 
 ### Building
 
-The project has no external dependencies. You can compile the parser and its test harness using a C99 compiler like GCC or Clang.
+The project has no external dependencies. You can compile the library and its test suite using a C99 compiler like GCC or Clang.
 
 ```bash
-# Compile the parser with the test main
-gcc -o test_parser regex-parser.c -DTEST_MAIN -Wall -Wextra -std=c99
+# Compile the engine with the test harness
+gcc -o test_engine regex-parser.c regex-match.c regex-unicode.c regex-test.c -Wall -Wextra -std=c99
 
 # Run the test suite
-./test_parser
+./test_engine
 ```
 
 ---
 
 ### Roadmap & Contributing
 
-This project was started as an exploration of modern regex parsing. Contributions are welcome to make it more robust and suitable for production use. High-priority areas include:
+This project is an excellent platform for exploring regex engine design. Contributions are welcome to make it more robust and performant. High-priority areas include:
 
--   [ ] **Thread Safety:** Refactor the Unicode property cache to be thread-local or passed via a context struct, removing all global state.
--   [ ] **API Ergonomics:** Introduce an opaque `RegexParseResult` struct to hide the `AstArena` from the public API, simplifying the `create`/`destroy` lifecycle.
--   [ ] **Full Unicode Support:** Integrate code generation scripts to build comprehensive property and character-folding tables from the official Unicode Character Database (UCD).
--   [ ] **AST Optimization:** Add optional passes to simplify the AST (e.g., constant folding, merging character nodes).
--   [ ] **CI & Testing:** Expand the test suite and set up more comprehensive continuous integration checks.
+-   [ ] **Performance Optimization:** Profile and optimize the VM loop, reduce memory allocations during matching, and implement bytecode optimizations (e.g., peephole optimizations).
+-   [ ] **Full Unicode Support:** Integrate code generation scripts to build comprehensive property, script, and character-folding tables from the official Unicode Character Database (UCD).
+-   [ ] **JIT Compilation:** Explore adding a Just-In-Time (JIT) compiler backend (e.g., targeting x86-64) for performance-critical patterns.
+-   [ ] **CI & Testing:** Expand the test suite for more comprehensive coverage and set up continuous integration checks.
 
 Please feel free to open an issue to discuss a new feature or submit a pull request.
 
 ### License
 
-This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the **MIT License**.
 
 ### Author
 

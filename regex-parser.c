@@ -1,158 +1,150 @@
 /*
 ===============================================================================
-    regex-parser.c
+    librex-ast - A PCRE2-Compatible Regex Engine
 
     Author: Mounir IDRASSI <mounir.idrassi@amcrypto.jp>
-    Date: July 13, 2025
+    Date: July 19, 2025
     License: MIT
 
     Description:
     ------------
-    This file implements a feature-rich PCRE/Perl-compatible regular expression 
-    parser in C, supporting Unicode, advanced grouping constructs, recursive 
-    patterns, and comprehensive error reporting with line/column information.
+    This file is part of a high-performance, feature-rich, and PCRE2-compatible
+    regular expression engine written in C. The library implements both a
+    sophisticated parser and a bytecode execution engine (virtual machine) to
+    provide a complete compile-and-match solution. It is designed for
+    portability, performance, and API clarity, with extensive support for
+    modern regex features including Unicode properties, advanced grouping,
+    and recursive patterns.
 
-    Features:
-    ---------
-    - Recursive descent parsing to build an Abstract Syntax Tree (AST)
-    - Two-phase parsing with deferred fixup resolution for forward references
-    - Unicode-aware parsing using built-in UTF-8 decoder (no locale dependency)
-    - Named capture groups (?<name>...) and named backreferences (\k<name>)
-    - Numbered backreferences (\1, \2, etc.) with validation
-    - Atomic groups (?>...) for possessive matching
-    - Lookahead (?=..., ?!...) and lookbehind (?<=..., ?<!...) assertions
-    - Possessive (+), lazy (?), and greedy quantifiers with context sensitivity
-    - Branch-reset groups (?|...) for capture group reuse across alternations
-    - Conditional patterns (?(condition)yes|no) with multiple condition types:
-      * Numeric conditions (?(1)...)
-      * Named conditions (?(<name>)...)  
-      * Assertion conditions (?((?=...))...)
-    - Subroutine calls for pattern recursion:
-      * Full recursion (?R)
-      * Numbered calls (?1, ?2, etc.)
-      * Named calls (?&name)
-    - Inline comments (?#...) and mode modifiers (?flags:...)
-    - Quoted sequences \Q...\E for literal matching
-    - Extended Unicode escapes \x{...} and \u{...}
-    - POSIX character classes [[:alpha:]], [[:digit:]], etc.
-    - Unicode property escapes \p{...} and \P{...} (framework ready)
-    - Context-sensitive anchor validation (^ position checking)
-    - Comprehensive character class parsing with nested bracket support
-    - Inline flag modifications (?i), (?-i), (?i:...) for case sensitivity, etc.
-    - Hexadecimal escape sequences (\x20, \x{1F600})
-    - Standard escape sequences (\t, \n, \r, \f, etc.)
-    - Arena-based memory management for optimal performance
-    - Comprehensive error reporting with UTF-8 aware position tracking
-    - Thread-safe implementation with no global state
-    - Extensive test suite covering edge cases and error conditions
+    Key Architectural Features:
+    ---------------------------
+    - Two-Stage Compilation:
+      1. A recursive descent parser builds a detailed Abstract Syntax Tree (AST)
+         from the regex pattern.
+      2. An AST-to-bytecode compiler translates the tree into a linear, compact
+         instruction set for the VM.
+    - NFA-based Virtual Machine (VM):
+      * A custom VM executes the compiled bytecode to perform the match.
+      * Implements a thread-based, backtracking NFA algorithm.
+      * Uses a "visited" set for memoization to prevent redundant work and handle
+        complex patterns with overlapping subproblems efficiently.
+    - Pluggable Memory Management:
+      * Core API supports custom allocators ('malloc', 'realloc', 'free'),
+        allowing integration into projects with specific memory strategies.
+      * The parser uses an internal arena allocator for efficient AST node
+        management during compilation.
+    - Comprehensive PCRE2 Compatibility:
+      * Supports a wide array of advanced constructs found in PCRE2 and Perl.
+      * Passes an extensive test suite covering syntax, matching, edge cases,
+        and error conditions.
+    - Detailed Error Reporting:
+      * Provides structured error objects with error codes, messages, and the
+        exact line/column number of the error in the pattern.
+    - Unicode-Awareness:
+      * Full UTF-8 support in both the parser and the matching engine.
+      * Built-in support for Unicode property matching (\p, \P) using efficient
+        bitmaps.
 
     Implementation Details:
-    ---------------
-    - Uses flexible AST node structures for all regex constructs
-    - Parser state tracks position, captures, named groups, and parse context
-    - Two-phase parsing: initial AST construction + deferred fixup resolution
-    - Width analysis for lookbehind assertion validation (fixed-width requirement)
-    - Arena-based memory management for AST nodes (bulk deallocation)
-    - Dynamic arrays for named groups and fixup tracking
-    - Single-pass UTF-8 validation with detailed error context
-    - Quantifier type resolution based on global ungreedy flag and local modifiers
-    - Conditional parsing context for proper alternation handling
-    - Comprehensive semantic validation with forward reference checking
-    - Unicode property bitmap caching for performance
-    - Error reporting with line/column information
-    - Proper handling of nested character classes and POSIX classes
-    - Flag inheritance and scoping for inline modifiers
-    - Quantifier validation (no double quantifiers, no quantifying assertions)
+    -----------------------
+    - Parser:
+      * Recursive descent with two-phase fixup for resolving forward references
+        (e.g., '\k<name>' before '(?<name>...)').
+      * Detailed tracking of parser state, including capture counts, named groups,
+        and inline flag modifiers.
+      * Semantic validation, including fixed-width checks for lookbehind assertions.
+    - AST-to-Bytecode Compiler:
+      * Translates the AST into a simple and efficient instruction set (e.g.,
+        CHAR, ANY, SPLIT, JMP, SAVE, CALL).
+      * Capturing groups are compiled into callable subroutines.
+    - NFA Virtual Machine (VM):
+      * The core matching logic is a loop processing VM instructions.
+      * Backtracking is managed by pushing alternative execution paths (threads)
+        onto a stack.
+      * Instructions for advanced features like atomic groups ('I_MARK_ATOMIC',
+        'I_CUT_TO_MARK'), conditionals ('I_GCOND'), and assertions ('I_ACOND', 'I_LBCOND').
+    - Unicode:
+      * Safe, single-pass UTF-8 decoding.
+      * Unicode property matching uses pre-computed range data to build bitmaps,
+        which are cached in the AST arena for performance.
+      * Unified character class builder handles standard classes ('[a-z]'),
+        shorthands ('\d', '\w'), and POSIX classes ('[[:digit:]]') in a
+        Unicode-aware manner.
+    - API:
+      * Clean, two-stage API ('regex_compile', 'regex_match', 'regex_free').
+      * Opaque 'regex_compiled*' handle encapsulates the compiled pattern.
+      * Match results are returned in a structured, easy-to-use format.
 
     Supported Regex Constructs:
     ---------------------------
     Basic Elements:
-    - Literal characters (including Unicode)
-    - Character classes [abc], [^abc], [a-z]
-    - Predefined classes: \d, \D, \w, \W, \s, \S
-    - Dot metacharacter (.)
-    - Anchors: ^, $, \A, \z, \b, \B
-    
+    - Literal characters (full Unicode support)
+    - Character classes '[abc]', '[^abc]', '[a-z]'
+    - Predefined classes: '\d', '\D', '\w', '\W', '\s', '\S'
+    - Dot metacharacter '.' (respects single-line mode)
+    - Anchors: '^', '$', '\A', '\z', '\b', '\B'
+
     Quantifiers:
-    - *, +, ?, {n}, {n,}, {n,m}
-    - Lazy variants: *?, +?, ??, {n,m}?
-    - Possessive variants: *+, ++, ?+, {n,m}+
-    
+    - Greedy: '*', '+', '?', '{n}', '{n,}', '{n,m}'
+    - Lazy (Non-greedy): '*?', '+?', '??', '{n,m}?'
+    - Possessive: '*+', '++', '?+', '{n,m}+'
+
     Groups:
-    - Capturing groups: (...)
-    - Non-capturing groups: (?:...)
-    - Named groups: (?<name>...)
-    - Atomic groups: (?>...)
-    - Branch-reset groups: (?|...)
-    
+    - Capturing groups: '(...)'
+    - Non-capturing groups: '(?:...)'
+    - Named groups: '(?<name>...)', '(?'name'...)'
+    - Atomic groups: '(?>...)'
+    - Branch-reset groups: '(?|...)'
+
     Assertions:
-    - Positive lookahead: (?=...)
-    - Negative lookahead: (?!...)
-    - Positive lookbehind: (?<=...)
-    - Negative lookbehind: (?<!...)
-    
+    - Positive lookahead: '(?=...)'
+    - Negative lookahead: '(?!...)'
+    - Positive lookbehind: '(?<=...)'
+    - Negative lookbehind: '(?<!...)'
+
     Backreferences:
-    - Numbered: \1, \2, etc.
-    - Named: \k<name>
-    
+    - Numbered: '\1', '\2', etc.
+    - Named: '\k<name>', '\k'name''
+
     Conditionals:
-    - Numeric: (?(1)yes|no)
-    - Named: (?(<name>)yes|no)
-    - Assertion: (?((?=...))yes|no)
-    
+    - By group number: '(?(1)yes|no)'
+    - By group name: '(?(<name>)yes|no)'
+    - By assertion: '(?(?=...)yes|no)'
+
     Subroutines:
-    - Full recursion: (?R)
-    - Numbered calls: (?1), (?2), etc.
-    - Named calls: (?&name)
-    
-    Modifiers:
-    - Inline flags: (?i), (?m), (?s), (?x), (?U)
-    - Scoped flags: (?i:...)
-    - Flag negation: (?-i)
-    
-    Unicode Support:
-    - UTF-8 input validation
-    - Unicode escapes: \x{...}, \u{...}
-    - Unicode properties: \p{...}, \P{...}
-    - Full range of Unicode characters
-    
-    Other Features:
-    - Comments: (?#...)
-    - Quoted sequences: \Q...\E
-    - POSIX character classes: [[:alpha:]], etc.
+    - Full pattern recursion: '(?R)'
+    - By group number: '(?1)', '(?2)', etc.
+    - By group name: '(?&name)'
+
+    Modifiers & Comments:
+    - Inline flags: '(?i)', '(?-m)', etc.
+    - Scoped flags: '(?i:...)'
+    - Comments: '(?#...)'
+
+    Unicode & Escapes:
+    - UTF-8 input processing and validation.
+    - Unicode properties: '\p{L}', '\P{Sc}', etc.
+    - Hex escapes: '\x20', '\x{1F600}'
+    - Quoted sequences: '\Q...\E'
+    - POSIX character classes: '[[:alpha:]]', '[[:digit:]]', etc.
 
     Current Limitations:
-    -------------------
-    - Parser only (no execution engine included)
-    - No AST optimization passes
-    - No bytecode generation or compilation
-    - POSIX character classes use basic implementation
-    - Unicode property support is framework-ready but uses simplified data
-    - No support for variable-length lookbehind assertions
-    - Maximum lookbehind length limited to 255 characters (PCRE compatible)
-    - Property cache limited to 32 entries
-    - No support for \R (generic newline), \X (extended grapheme cluster)
-    - No support for (*VERB) constructs like (*SKIP), (*FAIL)
-    - No support for \g{...} backreference syntax
-    - No support for recursive balancing groups
-
-    Usage:
-    ------
-    RegexNode* ast = regex_parse(pattern, flags, &arena, &error_msg);
-    if (ast) {
-        print_regex_ast(ast);
-        regex_free_result(ast, arena);  // Cleanup
-    } else {
-        printf("Error: %s\n", error_msg);
-        free(error_msg);
-    }
-    regex_cleanup_property_cache();
+    --------------------
+    - No AST or bytecode optimization passes are currently performed.
+    - Lookbehind assertions must be fixed-length (variable-length lookbehind is not supported).
+    - Maximum lookbehind length is 255 characters (PCRE2 compatible).
+    - No support for '\g{...}' backreference/subroutine syntax (use '\k<>', '(?n)' instead).
+    - No support for script runs or grapheme clusters ('\X').
+    - No support for generic newline sequences ('\R').
+    - No support for control verbs like '(*SKIP)', '(*FAIL)', '(*ACCEPT)'.
+    - No support for callouts.
 ===============================================================================
 */
 
 #ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS
 #define _CRT_NONSTDC_NO_WARNINGS
+#include <windows.h>
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -160,6 +152,8 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include "regex-parser.h"
+#include "regex-unicode.h"
+#include "regex-internals.h"
 
 // Opaque struct definition, hidden from the public header.
 struct regex_compiled {
@@ -202,7 +196,7 @@ static const regex_allocator default_allocator = {
 // 2. Arena Allocation
 // ----------------------------------------------------------------------------
 
-static void *arena_alloc(AstArena *arena, size_t size) {
+void *arena_alloc(AstArena *arena, size_t size) {
     if (!arena->blocks || arena->blocks->used + size > arena->blocks->cap) {
         size_t cap = size > 64*1024 ? size : 64*1024;
         Block *block = arena->allocator.malloc_func(sizeof(Block), arena->allocator.user_data);
@@ -369,7 +363,7 @@ static char *ascii_lower(const char *str, ParserState* state) {
     }
     
     for (size_t i = 0; i < len; i++) {
-        result[i] = tolower(str[i]);
+        result[i] = (char) tolower(str[i]);
     }
     result[len] = '\0';
     return result;
@@ -378,204 +372,6 @@ static char *ascii_lower(const char *str, ParserState* state) {
 // ----------------------------------------------------------------------------
 // 6. Unicode Properties Support
 // ----------------------------------------------------------------------------
-
-// Unicode category mappings - simplified version for demonstration
-// In production, this would be generated from Unicode data files
-typedef struct {
-    uint32_t start;
-    uint32_t end;
-    const char* category;
-} UnicodeRange;
-
-// Sample Unicode ranges for major categories (this would be much larger in production)
-static const UnicodeRange unicode_ranges[] = {
-    // Basic Latin uppercase letters
-    {0x0041, 0x005A, "Lu"},
-    {0x0041, 0x005A, "L"},
-    
-    // Basic Latin lowercase letters
-    {0x0061, 0x007A, "Ll"},
-    {0x0061, 0x007A, "L"},
-    
-    // Latin-1 Supplement uppercase
-    {0x00C0, 0x00D6, "Lu"},
-    {0x00C0, 0x00D6, "L"},
-    {0x00D8, 0x00DE, "Lu"},
-    {0x00D8, 0x00DE, "L"},
-    
-    // Latin-1 Supplement lowercase
-    {0x00E0, 0x00F6, "Ll"},
-    {0x00E0, 0x00F6, "L"},
-    {0x00F8, 0x00FF, "Ll"},
-    {0x00F8, 0x00FF, "L"},
-    
-    // ASCII digits
-    {0x0030, 0x0039, "Nd"},
-    {0x0030, 0x0039, "N"},
-    
-    // ASCII punctuation
-    {0x0021, 0x002F, "Po"},
-    {0x0021, 0x002F, "P"},
-    {0x003A, 0x0040, "Po"},
-    {0x003A, 0x0040, "P"},
-    {0x005B, 0x0060, "Po"},
-    {0x005B, 0x0060, "P"},
-    {0x007B, 0x007E, "Po"},
-    {0x007B, 0x007E, "P"},
-    
-    // ASCII whitespace
-    {0x0009, 0x000D, "Cc"},
-    {0x0009, 0x000D, "C"},
-    {0x0020, 0x0020, "Zs"},
-    {0x0020, 0x0020, "Z"},
-    
-    // Greek uppercase
-    {0x0391, 0x03A1, "Lu"},
-    {0x0391, 0x03A1, "L"},
-    {0x03A3, 0x03AB, "Lu"},
-    {0x03A3, 0x03AB, "L"},
-    
-    // Greek lowercase
-    {0x03B1, 0x03C1, "Ll"},
-    {0x03B1, 0x03C1, "L"},
-    {0x03C3, 0x03CB, "Ll"},
-    {0x03C3, 0x03CB, "L"},
-    
-    // Cyrillic uppercase
-    {0x0410, 0x042F, "Lu"},
-    {0x0410, 0x042F, "L"},
-    
-    // Cyrillic lowercase
-    {0x0430, 0x044F, "Ll"},
-    {0x0430, 0x044F, "L"},
-    
-    // End marker
-    {0, 0, NULL}
-};
-
-// Cache for computed bitmaps
-#define MAX_CACHED_PROPERTIES 32
-static struct {
-    char* name;
-    uint32_t* bitmap;
-    bool computed;
-} property_cache[MAX_CACHED_PROPERTIES];
-
-static int property_cache_count = 0;
-
-// Bitmap size for Unicode code points (covers BMP + supplementary planes)
-#define BITMAP_SIZE (0x110000 / 32)
-
-static void set_bit_in_bitmap(uint32_t* bitmap, uint32_t codepoint) {
-    if (codepoint >= 0x110000) return;
-    bitmap[codepoint / 32] |= (1U << (codepoint % 32));
-}
-
-static bool is_bit_set_in_bitmap(uint32_t* bitmap, uint32_t codepoint) {
-    if (codepoint >= 0x110000) return false;
-    return (bitmap[codepoint / 32] & (1U << (codepoint % 32))) != 0;
-}
-
-// Check if a property name matches (handles both full names and abbreviations)
-static bool property_matches(const char* prop_name, const char* target) {
-    if (!prop_name || !target) return false;
-    
-    // Exact match
-    if (strcmp(prop_name, target) == 0) return true;
-    
-    // Handle common aliases
-    if (strcmp(prop_name, "alpha") == 0 && strcmp(target, "L") == 0) return true;
-    if (strcmp(prop_name, "alnum") == 0 && (strcmp(target, "L") == 0 || strcmp(target, "N") == 0)) return true;
-    if (strcmp(prop_name, "digit") == 0 && strcmp(target, "Nd") == 0) return true;
-    if (strcmp(prop_name, "space") == 0 && (strcmp(target, "Z") == 0 || strcmp(target, "Cc") == 0)) return true;
-    if (strcmp(prop_name, "upper") == 0 && strcmp(target, "Lu") == 0) return true;
-    if (strcmp(prop_name, "lower") == 0 && strcmp(target, "Ll") == 0) return true;
-    if (strcmp(prop_name, "punct") == 0 && strcmp(target, "P") == 0) return true;
-    
-    return false;
-}
-
-// Build a bitmap for a specific Unicode property
-static uint32_t* build_unicode_bitmap(const char* prop_name) {
-    uint32_t* bitmap = calloc(BITMAP_SIZE, sizeof(uint32_t));
-    if (!bitmap) return NULL;
-    
-    // Handle special composite properties
-    if (strcmp(prop_name, "alnum") == 0) {
-        // Alphanumeric = Letters + Numbers
-        for (const UnicodeRange* range = unicode_ranges; range->category; range++) {
-            if (property_matches("L", range->category) || property_matches("N", range->category)) {
-                for (uint32_t cp = range->start; cp <= range->end; cp++) {
-                    set_bit_in_bitmap(bitmap, cp);
-                }
-            }
-        }
-        return bitmap;
-    }
-    
-    if (strcmp(prop_name, "word") == 0) {
-        // Word characters = Letters + Numbers + Underscore
-        for (const UnicodeRange* range = unicode_ranges; range->category; range++) {
-            if (property_matches("L", range->category) || property_matches("N", range->category)) {
-                for (uint32_t cp = range->start; cp <= range->end; cp++) {
-                    set_bit_in_bitmap(bitmap, cp);
-                }
-            }
-        }
-        set_bit_in_bitmap(bitmap, '_'); // Add underscore
-        return bitmap;
-    }
-    
-    if (strcmp(prop_name, "space") == 0) {
-        // Space characters = Separators + some control characters
-        for (const UnicodeRange* range = unicode_ranges; range->category; range++) {
-            if (property_matches("space", range->category)) {
-                for (uint32_t cp = range->start; cp <= range->end; cp++) {
-                    set_bit_in_bitmap(bitmap, cp);
-                }
-            }
-        }
-        return bitmap;
-    }
-    
-    // Handle standard Unicode categories
-    for (const UnicodeRange* range = unicode_ranges; range->category; range++) {
-        if (property_matches(prop_name, range->category)) {
-            for (uint32_t cp = range->start; cp <= range->end; cp++) {
-                set_bit_in_bitmap(bitmap, cp);
-            }
-        }
-    }
-    
-    return bitmap;
-}
-
-// Find cached bitmap or compute it
-static uint32_t* get_cached_bitmap(ParserState* state, const char* prop_name) {
-    // Check cache first
-    for (int i = 0; i < property_cache_count; i++) {
-        if (property_cache[i].name && strcmp(property_cache[i].name, prop_name) == 0) {
-            return property_cache[i].bitmap;
-        }
-    }
-    
-    // Not in cache, compute it
-    if (property_cache_count >= MAX_CACHED_PROPERTIES) {
-        // Cache is full, just compute without caching
-        return build_unicode_bitmap(prop_name);
-    }
-    
-    uint32_t* bitmap = build_unicode_bitmap(prop_name);
-    if (bitmap) {
-        // Add to cache
-        property_cache[property_cache_count].name = pstrdup(state, prop_name);
-        property_cache[property_cache_count].bitmap = bitmap;
-        property_cache[property_cache_count].computed = true;
-        property_cache_count++;
-    }
-    
-    return bitmap;
-}
 
 // Enhanced property existence check
 static bool unicode_property_exists(const char* name) {
@@ -614,30 +410,6 @@ static bool unicode_property_exists(const char* name) {
     return false;
 }
 
-// Enhanced bitmap retrieval function
-static uint32_t* unicode_bitmap_for(ParserState* state, const char* name) {
-    if (!name || !unicode_property_exists(name)) {
-        return NULL;
-    }
-    
-    return get_cached_bitmap(state, name);
-}
-
-// Cleanup function for property cache
-void regex_cleanup_property_cache(void) {
-    for (int i = 0; i < property_cache_count; i++) {
-        if (property_cache[i].name) {
-            free(property_cache[i].name);
-            property_cache[i].name = NULL;
-        }
-        if (property_cache[i].bitmap) {
-            free(property_cache[i].bitmap);
-            property_cache[i].bitmap = NULL;
-        }
-    }
-    property_cache_count = 0;
-}
-
 // ----------------------------------------------------------------------------
 // 7. Forward declarations
 // ----------------------------------------------------------------------------
@@ -646,7 +418,7 @@ RegexNode* parse_term(ParserState *state);
 RegexNode* parse_factor(ParserState *state);
 RegexNode* parse_atom(ParserState *state);
 void set_error(ParserState *state, int error_code, const char *msg_override);
-static int compute_width(RegexNode *node, int *min, int *max);
+int compute_width(RegexNode *node, int *min, int *max);
 
 // ----------------------------------------------------------------------------
 // 8. Helper functions for creating AST nodes
@@ -665,7 +437,7 @@ RegexNode* create_node(RegexNodeType type, ParserState *state) {
 }
 
 RegexNode* create_char_node(uint32_t codepoint, ParserState *state) {
-    RegexNode *node = create_node(NODE_CHAR, state);
+    RegexNode *node = create_node(REGEX_NODE_CHAR, state);
     if (!node) return NULL;
     node->data.codepoint = codepoint;
     return node;
@@ -673,7 +445,7 @@ RegexNode* create_char_node(uint32_t codepoint, ParserState *state) {
 
 RegexNode* create_concat_node(RegexNode *left, RegexNode *right, ParserState *state) {
     if (!left && !right) {
-        RegexNode *node = create_node(NODE_CONCAT, state);
+        RegexNode *node = create_node(REGEX_NODE_CONCAT, state);
         if (!node) return NULL;
         node->data.children.left = NULL;
         node->data.children.right = NULL;
@@ -682,7 +454,7 @@ RegexNode* create_concat_node(RegexNode *left, RegexNode *right, ParserState *st
     if (!left) return right;
     if (!right) return left;
     
-    RegexNode *node = create_node(NODE_CONCAT, state);
+    RegexNode *node = create_node(REGEX_NODE_CONCAT, state);
     if (!node) return NULL;
     node->data.children.left = left;
     node->data.children.right = right;
@@ -690,7 +462,7 @@ RegexNode* create_concat_node(RegexNode *left, RegexNode *right, ParserState *st
 }
 
 RegexNode* create_alternation_node(RegexNode *left, RegexNode *right, ParserState *state) {
-    RegexNode *node = create_node(NODE_ALTERNATION, state);
+    RegexNode *node = create_node(REGEX_NODE_ALTERNATION, state);
     if (!node) return NULL;
     node->data.children.left = left;
     node->data.children.right = right;
@@ -698,7 +470,7 @@ RegexNode* create_alternation_node(RegexNode *left, RegexNode *right, ParserStat
 }
 
 RegexNode* create_quantifier_node(RegexNode *child, int min, int max, QuantifierType type, ParserState *state) {
-    RegexNode *node = create_node(NODE_QUANTIFIER, state);
+    RegexNode *node = create_node(REGEX_NODE_QUANTIFIER, state);
     if (!node) return NULL;
     node->data.quantifier.child = child;
     node->data.quantifier.min = min;
@@ -708,7 +480,7 @@ RegexNode* create_quantifier_node(RegexNode *child, int min, int max, Quantifier
 }
 
 RegexNode* create_group_node(RegexNode *child, int capture_index, char *name, bool is_atomic, ParserState *state) {
-    RegexNode *node = create_node(NODE_GROUP, state);
+    RegexNode *node = create_node(REGEX_NODE_GROUP, state);
     if (!node) return NULL;
     node->data.group.child = child;
     node->data.group.capture_index = capture_index;
@@ -720,7 +492,7 @@ RegexNode* create_group_node(RegexNode *child, int capture_index, char *name, bo
 }
 
 RegexNode* create_char_class_node(char *set, bool negated, bool is_posix, ParserState *state) {
-    RegexNode *node = create_node(NODE_CHAR_CLASS, state);
+    RegexNode *node = create_node(REGEX_NODE_CHAR_CLASS, state);
     if (!node) return NULL;
     node->data.char_class.set = set;
     node->data.char_class.negated = negated;
@@ -729,18 +501,18 @@ RegexNode* create_char_class_node(char *set, bool negated, bool is_posix, Parser
 }
 
 RegexNode* create_anchor_node(char type, ParserState *state) {
-    RegexNode *node = create_node(NODE_ANCHOR, state);
+    RegexNode *node = create_node(REGEX_NODE_ANCHOR, state);
     if (!node) return NULL;
     node->data.anchor_type = type;
     return node;
 }
 
 RegexNode* create_dot_node(ParserState *state) {
-    return create_node(NODE_DOT, state);
+    return create_node(REGEX_NODE_DOT, state);
 }
 
 RegexNode* create_backref_node(int index, char *name, ParserState *state) {
-    RegexNode *node = create_node(NODE_BACKREF, state);
+    RegexNode *node = create_node(REGEX_NODE_BACKREF, state);
     if (!node) return NULL;
     node->data.backref.ref_index = index;
     node->data.backref.ref_name = name;
@@ -748,24 +520,23 @@ RegexNode* create_backref_node(int index, char *name, ParserState *state) {
 }
 
 RegexNode* create_assertion_node(RegexNode *child, AssertionType type, ParserState *state) {
-    RegexNode *node = create_node(NODE_ASSERTION, state);
+    RegexNode *node = create_node(REGEX_NODE_ASSERTION, state);
     if (!node) return NULL;
     node->data.assertion.child = child;
     node->data.assertion.assert_type = type;
     return node;
 }
 
-RegexNode* create_uni_prop_node(bool negated, char *prop_name, uint32_t *bitmap, ParserState *state) {
-    RegexNode *node = create_node(NODE_UNI_PROP, state);
+RegexNode* create_uni_prop_node(bool negated, char *prop_name, ParserState *state) {
+    RegexNode *node = create_node(REGEX_NODE_UNI_PROP, state);
     if (!node) return NULL;
     node->data.uni_prop.negated = negated;
     node->data.uni_prop.prop_name = prop_name;
-    node->data.uni_prop.bitmap = bitmap;
     return node;
 }
 
 RegexNode* create_conditional_node(Condition cond, RegexNode *if_true, RegexNode *if_false, ParserState *state) {
-    RegexNode *node = create_node(NODE_CONDITIONAL, state);
+    RegexNode *node = create_node(REGEX_NODE_CONDITIONAL, state);
     if (!node) return NULL;
     node->data.conditional.cond = cond;
     node->data.conditional.if_true = if_true;
@@ -774,7 +545,7 @@ RegexNode* create_conditional_node(Condition cond, RegexNode *if_true, RegexNode
 }
 
 RegexNode* create_subroutine_node(bool is_recursion, int target_index, char *target_name, ParserState *state) {
-    RegexNode *node = create_node(NODE_SUBROUTINE, state);
+    RegexNode *node = create_node(REGEX_NODE_SUBROUTINE, state);
     if (!node) return NULL;
     node->data.subroutine.is_recursion = is_recursion;
     node->data.subroutine.target_index = target_index;
@@ -818,13 +589,13 @@ static void process_fixups(ParserState *state) {
         int group_index = find_named_group_index(state, fixup->name);
         
         if (group_index != -1) {
-            if (fixup->node->type == NODE_BACKREF) {
+            if (fixup->node->type == REGEX_NODE_BACKREF) {
                 fixup->node->data.backref.ref_index = group_index;
-            } else if (fixup->node->type == NODE_SUBROUTINE) {
+            } else if (fixup->node->type == REGEX_NODE_SUBROUTINE) {
                 fixup->node->data.subroutine.target_index = group_index;
             }
         } else {
-             if (fixup->node->type == NODE_BACKREF) {
+             if (fixup->node->type == REGEX_NODE_BACKREF) {
                 set_error(state, REGEX_ERR_UNDEFINED_GROUP, "Backreference to undefined named group");
              } else {
                 set_error(state, REGEX_ERR_UNDEFINED_GROUP, "Subroutine call to undefined named group");
@@ -837,15 +608,6 @@ static void process_fixups(ParserState *state) {
 // ----------------------------------------------------------------------------
 // 10. Named group management
 // ----------------------------------------------------------------------------
-
-static bool find_named_group(ParserState *state, const char *name) {
-    for (int i = 0; i < state->named_group_count; i++) {
-        if (strcmp(state->named_groups[i], name) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
 
 static bool add_named_group(ParserState *state, const char *name) {
     for (int i = 0; i < state->named_group_count; i++) {
@@ -901,7 +663,7 @@ static uint32_t next_codepoint(ParserState *state) {
         return 0;
     }
     
-    state->pos += len;
+    state->pos += (int) len;
     return codepoint;
 }
 
@@ -915,7 +677,7 @@ static bool match_codepoint(ParserState *state, uint32_t expected) {
 
 static bool match_sequence(ParserState *state, const char *seq) {
     if (strncmp(&state->pattern[state->pos], seq, strlen(seq)) == 0) {
-        state->pos += strlen(seq);
+        state->pos += (int) strlen(seq);
         return true;
     }
     return false;
@@ -929,7 +691,7 @@ static bool parse_number(ParserState *state, int *out_value, int max_digits) {
         return false;
     }
     *out_value = (int)val;
-    state->pos = end - state->pattern;
+    state->pos = (int)(end - state->pattern);
     return true;
 }
 
@@ -959,7 +721,7 @@ static char* parse_plain_name(ParserState *state) {
     return name;
 }
 
-static int hexval(char c) {
+static int hexval(uint32_t c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
@@ -974,27 +736,27 @@ static bool is_quantifier(uint32_t cp) {
 // 12. Width analysis for lookbehind validation
 // ----------------------------------------------------------------------------
 
-static int compute_width(RegexNode *node, int *min, int *max) {
+int compute_width(RegexNode *node, int *min, int *max) {
     if (!node) {
         *min = *max = 0;
         return 0;
     }
     
     switch (node->type) {
-        case NODE_CHAR:
-        case NODE_DOT:
-        case NODE_CHAR_CLASS:
-        case NODE_UNI_PROP:
+        case REGEX_NODE_CHAR:
+        case REGEX_NODE_DOT:
+        case REGEX_NODE_CHAR_CLASS:
+        case REGEX_NODE_UNI_PROP:
             *min = *max = 1;
             return 0;
             
-        case NODE_ANCHOR:
-        case NODE_BACKREF: // Can have variable width
-        case NODE_SUBROUTINE:
+        case REGEX_NODE_ANCHOR:
+        case REGEX_NODE_BACKREF: // Can have variable width
+        case REGEX_NODE_SUBROUTINE:
              *min = 0; *max = -1; // Unbounded
              return 0;
 
-        case NODE_CONCAT: {
+        case REGEX_NODE_CONCAT: {
             int lmin, lmax, rmin, rmax;
             compute_width(node->data.children.left, &lmin, &lmax);
             compute_width(node->data.children.right, &rmin, &rmax);
@@ -1003,7 +765,7 @@ static int compute_width(RegexNode *node, int *min, int *max) {
             return 0;
         }
         
-        case NODE_ALTERNATION: {
+        case REGEX_NODE_ALTERNATION: {
             int lmin, lmax, rmin, rmax;
             compute_width(node->data.children.left, &lmin, &lmax);
             compute_width(node->data.children.right, &rmin, &rmax);
@@ -1012,7 +774,7 @@ static int compute_width(RegexNode *node, int *min, int *max) {
             return 0;
         }
         
-        case NODE_QUANTIFIER: {
+        case REGEX_NODE_QUANTIFIER: {
             int cmin, cmax;
             compute_width(node->data.quantifier.child, &cmin, &cmax);
             *min = cmin * node->data.quantifier.min;
@@ -1020,11 +782,11 @@ static int compute_width(RegexNode *node, int *min, int *max) {
             return 0;
         }
         
-        case NODE_GROUP:
-        case NODE_BRESET_GROUP:
+        case REGEX_NODE_GROUP:
+        case REGEX_NODE_BRESET_GROUP:
             return compute_width(node->data.group.child, min, max);
 
-        case NODE_CONDITIONAL: {
+        case REGEX_NODE_CONDITIONAL: {
              int t_min, t_max, f_min = 0, f_max = 0;
              compute_width(node->data.conditional.if_true, &t_min, &t_max);
              if (node->data.conditional.if_false) {
@@ -1044,11 +806,15 @@ static int compute_width(RegexNode *node, int *min, int *max) {
 static void check_lookbehind(RegexNode *node, ParserState *state) {
     int min, max;
     compute_width(node, &min, &max);
-    if (min != max) {
-        set_error(state, REGEX_ERR_LOOKBEHIND_VAR, "Lookbehind assertion is not fixed length");
+    /* PCRE2 allows different fixed‑length alternatives;   */
+    /* it disallows only unbounded or too‑long paths.  */
+    if (max == -1) {
+        set_error(state, REGEX_ERR_LOOKBEHIND_VAR, 
+            "Lookbehind assertion is not fixed length");
     }
-    if (max > 255) { // PCRE limit
-        set_error(state, REGEX_ERR_LOOKBEHIND_LONG, "Lookbehind assertion is too long");
+    if (max > 255) { // same limit as PCRE
+        set_error(state, REGEX_ERR_LOOKBEHIND_LONG, 
+            "Lookbehind assertion is too long");
     }
 }
 
@@ -1191,7 +957,7 @@ static Condition parse_condition(ParserState *state) {
         /* Rewind one byte to give parse_atom() the '(' it expects. */
         state->pos--;                 /* now on '('                 */
         cond.data.assertion = parse_atom(state);
-        if (cond.data.assertion && cond.data.assertion->type == NODE_ASSERTION) {
+        if (cond.data.assertion && cond.data.assertion->type == REGEX_NODE_ASSERTION) {
             cond.type = COND_ASSERTION;
             return cond;
         }
@@ -1199,21 +965,21 @@ static Condition parse_condition(ParserState *state) {
         return cond;
     }
 
-    // This handles `(?(?<=...) ...)`
+    // This handles '(?(?<=...) ...)'
     if (peek_codepoint(state) == '(') {
         cond.type = COND_ASSERTION;
         cond.data.assertion = parse_atom(state);
-        if (state->has_error || !cond.data.assertion || cond.data.assertion->type != NODE_ASSERTION) {
+        if (state->has_error || !cond.data.assertion || cond.data.assertion->type != REGEX_NODE_ASSERTION) {
             set_error(state, REGEX_ERR_INVALID_CONDITION, "Condition is not a valid assertion");
             cond.type = COND_INVALID;
         }
     } else if (peek_codepoint(state) == '<' || peek_codepoint(state) == '\'') {
         cond.type = COND_NAMED;
-        char opener = next_codepoint(state);
+        char opener = (char) next_codepoint(state);
         char closer = (opener == '<') ? '>' : '\'';
         
         int start = state->pos;
-        while (peek_codepoint(state) != closer && peek_codepoint(state) != 0) {
+        while (peek_codepoint(state) != (uint32_t)closer && peek_codepoint(state) != 0) {
             next_codepoint(state);
         }
         if (!match_codepoint(state, closer)) {
@@ -1251,11 +1017,11 @@ static Condition parse_condition(ParserState *state) {
             }
         }
     } else {
-        // This handles `(?(?=...) ...)`
+        // This handles '(?(?=...) ...)'
         int old_pos = state->pos;
-        state->pos--; // go back to the `(`
+        state->pos--; // go back to the '('
         RegexNode* assertion = parse_atom(state);
-        if(assertion && assertion->type == NODE_ASSERTION) {
+        if(assertion && assertion->type == REGEX_NODE_ASSERTION) {
             cond.type = COND_ASSERTION;
             cond.data.assertion = assertion;
         } else {
@@ -1298,17 +1064,19 @@ RegexNode* parse_factor(ParserState *state) {
     RegexNode *atom = parse_atom(state);
     if (state->has_error || !atom) return atom;
     
-    // Anchors and assertions cannot be quantified
-    if (atom->type == NODE_ANCHOR || atom->type == NODE_ASSERTION) {
+    // Only anchors cannot be quantified in PCRE2  
+    // Assertions can be quantified (though it's effectively a no-op for zero-width assertions)
+    if (atom->type == REGEX_NODE_ANCHOR) {
         if (is_quantifier(peek_codepoint(state))) {
-            set_error(state, REGEX_ERR_INVALID_QUANT, "Cannot quantify an anchor or assertion");
+            set_error(state, REGEX_ERR_INVALID_QUANT, "Cannot quantify an anchor");
             return NULL;
         }
     }
 
     uint32_t q = peek_codepoint(state);
     int min = -1, max = -1;
-    QuantifierType quant_type = (state->flags & REG_UNGREEDY) ? QUANT_LAZY : QUANT_GREEDY;
+    bool default_lazy = (state->flags & REG_UNGREEDY) != 0;
+    QuantifierType quant_type = default_lazy ? QUANT_LAZY : QUANT_GREEDY;
 
     if (q == '*' || q == '+' || q == '?') {
         next_codepoint(state);
@@ -1316,9 +1084,9 @@ RegexNode* parse_factor(ParserState *state) {
         max = (q == '?') ? 1 : -1;
     } else if (q == '{') {
         next_codepoint(state);
-        if (!parse_number(state, &min, 0)) {
-            set_error(state, REGEX_ERR_INVALID_QUANT, "Expected number in quantifier {}");
-            return NULL;
+        bool parsed_min = parse_number(state, &min, 0);
+        if (!parsed_min) {
+            min = 0;
         }
         if (match_codepoint(state, ',')) {
             if (peek_codepoint(state) == '}') {
@@ -1328,6 +1096,10 @@ RegexNode* parse_factor(ParserState *state) {
                 return NULL;
             }
         } else {
+            if (!parsed_min) {
+                set_error(state, REGEX_ERR_INVALID_QUANT, "Expected number in quantifier {}");
+                return NULL;
+            }
             max = min;
         }
         if (!match_codepoint(state, '}')) {
@@ -1343,11 +1115,12 @@ RegexNode* parse_factor(ParserState *state) {
         }
         
         if (match_codepoint(state, '?')) {
-            quant_type = QUANT_LAZY;
+            /* '?' toggles greediness relative to the default */
+            quant_type = default_lazy ? QUANT_GREEDY : QUANT_LAZY;
         } else if (match_codepoint(state, '+')) {
             quant_type = QUANT_POSSESSIVE;
         }
-        
+
         if (is_quantifier(peek_codepoint(state))) {
             set_error(state, REGEX_ERR_INVALID_QUANT, "Double quantifier");
             return NULL;
@@ -1374,21 +1147,43 @@ RegexNode* parse_atom(ParserState *state) {
                 if (match_sequence(state, "R)")) return create_subroutine_node(true, 0, NULL, state);
                 
                 if (match_codepoint(state, '|')) {
-                    // Branch reset group
+                    // Branch reset group.
+                    // This logic is similar to parse_regex, but with capture count resets.
                     int save_count = state->capture_count;
-                    RegexNode *alt = parse_regex(state);
+
+                    // Parse the first branch.
+                    RegexNode *alt = parse_term(state);
                     if (state->has_error) return NULL;
-                    
+
+                    int max_captures_in_branch = state->capture_count;
+
                     while (peek_codepoint(state) == '|') {
                         next_codepoint(state);
+
+                        // Reset capture count for the new branch.
                         state->capture_count = save_count;
-                        RegexNode *more = parse_regex(state);
+
+                        RegexNode *more = parse_term(state);
                         if (state->has_error) return NULL;
+
+                        // Update the maximum capture count seen across all branches.
+                        if (state->capture_count > max_captures_in_branch) {
+                            max_captures_in_branch = state->capture_count;
+                        }
+
                         alt = create_alternation_node(alt, more, state);
                         if (!alt) return NULL;
                     }
-                    if (!match_codepoint(state, ')')) { set_error(state, REGEX_ERR_UNMATCHED_PAREN, "Unmatched '(' for branch reset group"); return NULL; }
-                    RegexNode *node = create_node(NODE_BRESET_GROUP, state);
+
+                    // The total capture count for the pattern is the max of any branch.
+                    state->capture_count = max_captures_in_branch;
+
+                    if (!match_codepoint(state, ')')) {
+                        set_error(state, REGEX_ERR_UNMATCHED_PAREN, "Unmatched '(' for branch reset group");
+                        return NULL;
+                    }
+
+                    RegexNode *node = create_node(REGEX_NODE_BRESET_GROUP, state);
                     if (!node) return NULL;
                     node->data.group.child = alt;
                     return node;
@@ -1453,7 +1248,7 @@ RegexNode* parse_atom(ParserState *state) {
                         next_codepoint(state);
                         while (peek_codepoint(state) != ')' && peek_codepoint(state) != 0) next_codepoint(state);
                         if (!match_codepoint(state, ')')) { set_error(state, REGEX_ERR_INVALID_SYNTAX, "Unclosed comment"); return NULL; }
-                        return create_node(NODE_COMMENT, state);
+                        return create_node(REGEX_NODE_COMMENT, state);
                     case '<': {
                         next_codepoint(state);
                         uint32_t next_next = peek_codepoint(state);
@@ -1482,7 +1277,12 @@ RegexNode* parse_atom(ParserState *state) {
                             state->flags = old_flags;
                             return group;
                         } else if (match_codepoint(state, ')')) {
-                            return create_group_node(NULL, -1, NULL, false, state);
+                            RegexNode *g = create_group_node(NULL, -1, NULL, false, state);
+                            if (g) {
+                                g->data.group.enter_flags = old_flags;
+                                g->data.group.exit_flags  = state->flags;
+                            }
+                            return g;
                         } else { set_error(state, REGEX_ERR_INVALID_SYNTAX, "Expected ':' or ')' after flags"); return NULL; }
                     }
                     default: {
@@ -1578,7 +1378,7 @@ RegexNode* parse_atom(ParserState *state) {
                 free(raw);
                 
                 if (!unicode_property_exists(name)) { set_error(state, REGEX_ERR_INVALID_PROP, "Unknown Unicode property"); free(name); return NULL; }
-                return create_uni_prop_node(neg, name, unicode_bitmap_for(state, name), state);
+                return create_uni_prop_node(neg, name, state);
             }
             
             if (escaped == 'x' || escaped == 'u') {
@@ -1620,7 +1420,7 @@ RegexNode* parse_atom(ParserState *state) {
                     uint32_t codepoint;
                     size_t len = utf8_decode(&state->pattern[i], &codepoint);
                     if (len == 0) { set_error(state, REGEX_ERR_INVALID_UTF8, "Invalid UTF-8 in \\Q...\\E"); return NULL; }
-                    i += len;
+                    i += (int) len;
                     RegexNode *char_node = create_char_node(codepoint, state);
                     if (!char_node) return NULL;
                     seq = create_concat_node(seq, char_node, state);
@@ -1633,24 +1433,24 @@ RegexNode* parse_atom(ParserState *state) {
                 state->pos = atom_start_pos + 1; // back up
                 int ref_val = 0;
                 parse_number(state, &ref_val, 0);
-                if (ref_val > state->capture_count) { set_error(state, REGEX_ERR_INVALID_BACKREF, "Backreference to undefined group"); return NULL; }
+                // we defer validity checking until after we know the total group count
                 return create_backref_node(ref_val, NULL, state);
             }
             
             if (escaped == 'k') {
-                if (!match_codepoint(state, '<')) { set_error(state, REGEX_ERR_INVALID_SYNTAX, "Expected '<' after \\k"); return NULL; }
-                char *name = parse_group_name(state);
-                if (!name) return NULL;
-                
-                int group_index = find_named_group_index(state, name);
-                if (group_index == -1) {
-                    set_error(state, REGEX_ERR_INVALID_BACKREF, "Backreference to undefined named group");
-                    free(name);
+                if (!match_codepoint(state, '<')) {
+                    set_error(state, REGEX_ERR_INVALID_SYNTAX, "Expected '<' after \\k");
                     return NULL;
                 }
-
+                char *name = parse_group_name(state);
+                if (!name) return NULL;
+                int group_index = find_named_group_index(state, name);
                 RegexNode *node = create_backref_node(group_index, name, state);
                 if (!node) { free(name); return NULL; }
+                if (group_index == -1) {
+                    // Defer validation; add a fixup for later resolution.
+                    add_fixup(state, node, name);
+                }
                 return node;
             }
             
@@ -1661,29 +1461,21 @@ RegexNode* parse_atom(ParserState *state) {
                     sprintf(set_str, "\\%c", (char)escaped);
                     return create_char_class_node(set_str, false, false, state);
                 }
-                case 'b': return create_anchor_node('b', state); case 'B': return create_anchor_node('B', state);
-                case 'A': return create_anchor_node('A', state); case 'z': return create_anchor_node('z', state);
-                case 't': return create_char_node('\t', state); case 'n': return create_char_node('\n', state);
-                case 'r': return create_char_node('\r', state); case 'f': return create_char_node('\f', state);
+                case 'b': return create_anchor_node('b', state);
+                case 'B': return create_anchor_node('B', state);
+                case 'A': return create_anchor_node('A', state);
+                case 'z': return create_anchor_node('z', state);
+                case 't': return create_char_node('\t', state);
+                case 'n': return create_char_node('\n', state);
+                case 'r': return create_char_node('\r', state);
+                case 'f': return create_char_node('\f', state);
                 default: return create_char_node(escaped, state);
             }
         }
         
         case '.': return create_dot_node(state);
         
-        case '^': 
-            /* '^' is only valid at pattern start or immediately after
-               '(' or '|'.  Everywhere else it is illegal. */
-            bool at_start   = (atom_start_pos == 0);
-            bool after_par  = (atom_start_pos > 0 &&
-                               state->pattern[atom_start_pos-1] == '(');
-            bool after_bar  = (atom_start_pos > 0 &&
-                               state->pattern[atom_start_pos-1] == '|');
-            if (at_start || after_par || after_bar) {
-                return create_anchor_node('^', state);
-            }
-            set_error(state, REGEX_ERR_INVALID_SYNTAX, "Misplaced '^' anchor");
-            return NULL;
+        case '^': return create_anchor_node('^', state);
         case '$': return create_anchor_node('$', state);
         
         case ')': case '|': case '*': case '+': case '?': case '{': case '}':
@@ -1705,40 +1497,40 @@ void free_regex_ast(RegexNode *node, const regex_allocator* allocator) {
     // This function frees dynamically allocated string data within the AST.
     // The AST nodes themselves are in the arena and are freed all at once.
     switch (node->type) {
-        case NODE_CHAR_CLASS:
+        case REGEX_NODE_CHAR_CLASS:
             if (node->data.char_class.set) {
                 allocator->free_func(node->data.char_class.set, allocator->user_data);
             }
             break;
-        case NODE_UNI_PROP:
+        case REGEX_NODE_UNI_PROP:
             if (node->data.uni_prop.prop_name) {
                 allocator->free_func(node->data.uni_prop.prop_name, allocator->user_data);
             }
             break;
-        case NODE_CONCAT:
-        case NODE_ALTERNATION:
+        case REGEX_NODE_CONCAT:
+        case REGEX_NODE_ALTERNATION:
             free_regex_ast(node->data.children.left, allocator);
             free_regex_ast(node->data.children.right, allocator);
             break;
-        case NODE_QUANTIFIER:
+        case REGEX_NODE_QUANTIFIER:
             free_regex_ast(node->data.quantifier.child, allocator);
             break;
-        case NODE_GROUP:
-        case NODE_BRESET_GROUP:
+        case REGEX_NODE_GROUP:
+        case REGEX_NODE_BRESET_GROUP:
             if (node->data.group.name) {
                 allocator->free_func(node->data.group.name, allocator->user_data);
             }
             free_regex_ast(node->data.group.child, allocator);
             break;
-        case NODE_BACKREF:
+        case REGEX_NODE_BACKREF:
             if (node->data.backref.ref_name) {
                 allocator->free_func(node->data.backref.ref_name, allocator->user_data);
             }
             break;
-        case NODE_ASSERTION:
+        case REGEX_NODE_ASSERTION:
             free_regex_ast(node->data.assertion.child, allocator);
             break;
-        case NODE_CONDITIONAL:
+        case REGEX_NODE_CONDITIONAL:
             if (node->data.conditional.cond.type == COND_NAMED && node->data.conditional.cond.data.group_name) {
                 allocator->free_func(node->data.conditional.cond.data.group_name, allocator->user_data);
             } else if (node->data.conditional.cond.type == COND_ASSERTION) {
@@ -1747,7 +1539,7 @@ void free_regex_ast(RegexNode *node, const regex_allocator* allocator) {
             free_regex_ast(node->data.conditional.if_true, allocator);
             free_regex_ast(node->data.conditional.if_false, allocator);
             break;
-        case NODE_SUBROUTINE:
+        case REGEX_NODE_SUBROUTINE:
             if (node->data.subroutine.target_name) {
                 allocator->free_func(node->data.subroutine.target_name, allocator->user_data);
             }
@@ -1762,37 +1554,37 @@ void print_regex_ast_recursive(const RegexNode *node, int indent) {
         printf("%*s(epsilon)\n", indent, "");
         return;
     }
-    if (node->type == NODE_COMMENT) return;
+    if (node->type == REGEX_NODE_COMMENT) return;
 
     for (int i = 0; i < indent; ++i) printf("  ");
 
     switch (node->type) {
-        case NODE_CHAR:
+        case REGEX_NODE_CHAR:
             if (node->data.codepoint < 128 && isprint(node->data.codepoint)) {
                 printf("CHAR: '%c'\n", (char)node->data.codepoint);
             } else {
                 printf("CHAR: U+%04X\n", node->data.codepoint);
             }
             break;
-        case NODE_DOT: printf("DOT: .\n"); break;
-        case NODE_ANCHOR: printf("ANCHOR: \\%c\n", node->data.anchor_type); break;
-        case NODE_CHAR_CLASS:
+        case REGEX_NODE_DOT: printf("DOT: .\n"); break;
+        case REGEX_NODE_ANCHOR: printf("ANCHOR: \\%c\n", node->data.anchor_type); break;
+        case REGEX_NODE_CHAR_CLASS:
             printf("CHAR_CLASS: [%s%s]\n", node->data.char_class.negated ? "^" : "", node->data.char_class.set);
             break;
-        case NODE_UNI_PROP:
+        case REGEX_NODE_UNI_PROP:
             printf("UNI_PROP: \\%c{%s}\n", node->data.uni_prop.negated ? 'P' : 'p', node->data.uni_prop.prop_name);
             break;
-        case NODE_CONCAT:
+        case REGEX_NODE_CONCAT:
             printf("CONCAT\n");
             print_regex_ast_recursive(node->data.children.left, indent + 1);
             print_regex_ast_recursive(node->data.children.right, indent + 1);
             break;
-        case NODE_ALTERNATION:
+        case REGEX_NODE_ALTERNATION:
             printf("ALTERNATION\n");
             print_regex_ast_recursive(node->data.children.left, indent + 1);
             print_regex_ast_recursive(node->data.children.right, indent + 1);
             break;
-        case NODE_QUANTIFIER: {
+        case REGEX_NODE_QUANTIFIER: {
             const char *q_type = "unknown";
             switch (node->data.quantifier.quant_type) {
                 case QUANT_GREEDY: q_type = "greedy"; break;
@@ -1806,21 +1598,21 @@ void print_regex_ast_recursive(const RegexNode *node, int indent) {
             print_regex_ast_recursive(node->data.quantifier.child, indent + 1);
             break;
         }
-        case NODE_GROUP:
+        case REGEX_NODE_GROUP:
             printf("GROUP (%s%s%s #%d)\n",
                    node->data.group.is_atomic ? "atomic" : (node->data.group.capture_index < 0 ? "non-capturing" : "capture"),
                    node->data.group.name ? ", name=" : "", node->data.group.name ? node->data.group.name : "",
                    node->data.group.capture_index);
             print_regex_ast_recursive(node->data.group.child, indent + 1);
             break;
-        case NODE_BACKREF:
+        case REGEX_NODE_BACKREF:
             if (node->data.backref.ref_name) {
                 printf("BACKREF: \\k<%s> (group %d)\n", node->data.backref.ref_name, node->data.backref.ref_index);
             } else {
                 printf("BACKREF: \\%d\n", node->data.backref.ref_index);
             }
             break;
-        case NODE_ASSERTION: {
+        case REGEX_NODE_ASSERTION: {
             const char *typestr = "";
             switch (node->data.assertion.assert_type) {
                 case ASSERT_LOOKAHEAD_POS: typestr = "LOOKAHEAD_POS (?=)"; break;
@@ -1832,11 +1624,11 @@ void print_regex_ast_recursive(const RegexNode *node, int indent) {
             print_regex_ast_recursive(node->data.assertion.child, indent + 1);
             break;
         }
-        case NODE_BRESET_GROUP:
+        case REGEX_NODE_BRESET_GROUP:
             printf("BRESET_GROUP (?|...)\n");
             print_regex_ast_recursive(node->data.group.child, indent + 1);
             break;
-        case NODE_CONDITIONAL:
+        case REGEX_NODE_CONDITIONAL:
             printf("CONDITIONAL (?(...)...)\n");
             printf("%*sCondition: ", indent + 1, "");
             switch (node->data.conditional.cond.type) {
@@ -1858,7 +1650,7 @@ void print_regex_ast_recursive(const RegexNode *node, int indent) {
                 print_regex_ast_recursive(node->data.conditional.if_false, indent + 2);
             }
             break;
-        case NODE_SUBROUTINE:
+        case REGEX_NODE_SUBROUTINE:
             if (node->data.subroutine.is_recursion) {
                 printf("SUBROUTINE: (?R)\n");
             } else if (node->data.subroutine.target_name) {
@@ -1867,13 +1659,13 @@ void print_regex_ast_recursive(const RegexNode *node, int indent) {
                 printf("SUBROUTINE: (?%d)\n", node->data.subroutine.target_index);
             }
             break;
-        case NODE_COMMENT: break; // Already handled
+        case REGEX_NODE_COMMENT: break; // Already handled
     }
 }
 
-void print_regex_ast(const RegexNode *root) {
-    if (!root) { printf("AST is empty.\n"); return; }
-    print_regex_ast_recursive(root, 0);
+void print_regex_ast(const regex_compiled *root) {
+    if (!root || !root->ast) { printf("AST is empty.\n"); return; }
+    print_regex_ast_recursive(root->ast, 0);
 }
 
 // ----------------------------------------------------------------------------
@@ -1905,6 +1697,48 @@ void free_parser_state_resources(ParserState* state) {
     arena_free(state->arena);
     allocator->free_func(state->arena, allocator->user_data);
     state->arena = NULL;
+}
+
+static void validate_numeric_backrefs(RegexNode *n, ParserState *st) {
+    if (!n || st->has_error) return;
+    if (n->type == REGEX_NODE_BACKREF && n->data.backref.ref_name == NULL) {
+        int idx = n->data.backref.ref_index;
+        if (idx < 1 || idx > st->capture_count) {
+            set_error(
+              st,
+              REGEX_ERR_INVALID_BACKREF,
+              "Backreference to undefined group"
+            );
+            return;
+        }
+    }
+    switch(n->type) {
+      case REGEX_NODE_CONCAT:
+        validate_numeric_backrefs(n->data.children.left,  st);
+        validate_numeric_backrefs(n->data.children.right, st);
+        break;
+      case REGEX_NODE_ALTERNATION:
+        validate_numeric_backrefs(n->data.children.left,  st);
+        validate_numeric_backrefs(n->data.children.right, st);
+        break;
+      case REGEX_NODE_QUANTIFIER:
+        validate_numeric_backrefs(n->data.quantifier.child, st);
+        break;
+      case REGEX_NODE_GROUP:
+      case REGEX_NODE_BRESET_GROUP:
+        validate_numeric_backrefs(n->data.group.child, st);
+        break;
+      case REGEX_NODE_ASSERTION:
+        validate_numeric_backrefs(n->data.assertion.child, st);
+        break;
+      case REGEX_NODE_CONDITIONAL:
+        validate_numeric_backrefs(n->data.conditional.if_true,  st);
+        if (n->data.conditional.if_false)
+          validate_numeric_backrefs(n->data.conditional.if_false, st);
+        break;
+      default:
+        break;
+    }
 }
 
 static RegexNode* regex_parse_internal(
@@ -1954,6 +1788,15 @@ static RegexNode* regex_parse_internal(
 
     if (peek_codepoint(&state) != 0) {
         set_error(&state, REGEX_ERR_INVALID_SYNTAX, "Unexpected characters at end of pattern");
+        *error = state.error;
+        free_parser_state_resources(&state);
+        return NULL;
+    }
+
+    if (!state.has_error) {
+        validate_numeric_backrefs(root, &state);
+    }
+    if (state.has_error) {
         *error = state.error;
         free_parser_state_resources(&state);
         return NULL;
@@ -2041,223 +1884,3 @@ void regex_free_match_result(regex_match_result* result, const regex_allocator* 
     if (result->capture_starts) allocator->free_func(result->capture_starts, allocator->user_data);
     if (result->capture_ends) allocator->free_func(result->capture_ends, allocator->user_data);
 }
-
-// ----------------------------------------------------------------------------
-// 18. Legacy API for Backward Compatibility
-// ----------------------------------------------------------------------------
-
-RegexNode* regex_parse(const char* pattern, unsigned compile_flags, AstArena** out_arena, char** error_msg) {
-    regex_err error;
-    int capture_count;
-
-    RegexNode* result = regex_parse_internal(pattern, compile_flags, &default_allocator, out_arena, &capture_count, &error);
-
-    if (error_msg) {
-        if (error.code != REGEX_OK) {
-            char buffer[256];
-            snprintf(buffer, sizeof(buffer), "Error at line %d, column %d: %s",
-                     error.line, error.col, error.msg);
-            *error_msg = strdup(buffer);
-        } else {
-            *error_msg = NULL;
-        }
-    }
-
-    return result;
-}
-
-void regex_free_result(RegexNode *root, AstArena *arena) {
-    if (!arena) return;
-    free_regex_ast(root, &default_allocator);
-    arena->allocator = default_allocator;
-    arena_free(arena);
-    free(arena);
-}
-#ifdef TEST_MAIN
-
-// ----------------------------------------------------------------------------
-// 19. Test Harness
-// ----------------------------------------------------------------------------
-// Global test counters
-static int total_tests = 0;
-static int total_failures = 0;
-
-int test_match(void) {
-    regex_err e;
-    regex_compiled *rx = regex_compile("a([0-9]+)b(?:foo)?bar", REG_EXTENDED, &e);
-    if (!rx) { printf("compile error: %s\n", e.msg); return 1; }
-
-    regex_match_result res = {0};
-    const char *text = "a123bbarxxx";
-    if (regex_match(rx, text, strlen(text), &res) > 0) {
-        printf("match [%d,%d]\n", res.match_start, res.match_end);
-        printf("group1 [%d,%d]\n", *res.capture_starts, *res.capture_ends);
-        regex_free_match_result(&res, NULL);
-    }
-    else {
-        printf("no match\n");
-    }
-    regex_free(rx);
-    regex_cleanup_property_cache();
-    return 0;
-}
-
-// Test helper function for the new enhanced parser
-void test_pattern(const char* pattern, bool expected_success, unsigned flags) {
-    total_tests++;
-    printf("====================================================\n");
-    printf("Parsing pattern: \"%s\"\n", pattern);
-    printf("Expected: %s\n", expected_success ? "SUCCESS" : "FAILURE");
-    printf("----------------------------------------------------\n");
-
-    regex_err error = {0};
-    regex_compiled* rx = regex_compile(pattern, flags, &error);
-
-    bool actual_success = (rx != NULL && error.code == REGEX_OK);
-
-    if (actual_success != expected_success) {
-        total_failures++;
-        printf(">> TEST RESULT: FAIL <<\n");
-        if (actual_success) {
-            printf("   (Expected failure, but got success)\n");
-            printf("   AST:\n");
-            print_regex_ast(rx->ast);
-        } else {
-            printf("   (Expected success, but got failure)\n");
-            printf("   Error: ");
-            if (error.code != REGEX_OK) {
-                printf("Error at line %d, column %d: %s\n", error.line, error.col, error.msg ? error.msg : "(unknown error)");
-            } else {
-                printf("(unknown error)\n");
-            }
-        }
-    } else {
-        printf(">> TEST RESULT: PASS <<\n");
-    }
-
-    if (rx) {
-        regex_free(rx);
-    }
-
-    printf("\n");
-}
-
-int main(void) {
-    unsigned default_flags = 0;
-
-    printf("\n--- SECTION 1: Basic Syntax & Quantifiers ---\n");
-    test_pattern("ab|cd", true, default_flags);
-    test_pattern("a(b|c)*d?", true, default_flags);
-    test_pattern("a+", true, default_flags);       // Greedy
-    test_pattern("a+?", true, default_flags);      // Lazy
-    test_pattern("a++", true, default_flags);      // Possessive
-    test_pattern("a{3,5}", true, default_flags);
-    test_pattern("a{3,}", true, default_flags);
-    test_pattern("a{3}", true, default_flags);
-    test_pattern("a{0,0}", true, default_flags);   // Valid zero-width match
-    test_pattern("a{3,1}", false, default_flags);  // Invalid range
-    test_pattern("a{,5}", false, default_flags);   // Missing min
-    test_pattern("{3}", false, default_flags);     // Quantifier without atom
-    test_pattern("a**", false, default_flags);     // Double quantifier
-
-    printf("\n--- SECTION 2: Groups & Backreferences ---\n");
-    test_pattern("a(b)c", true, default_flags);
-    test_pattern("(a)\\1", true, default_flags);
-    test_pattern("(a)(b)\\2\\1", true, default_flags);
-    test_pattern("(?:a)b", true, default_flags);    // Non-capturing group
-    test_pattern("(?<year>\\d{4})", true, default_flags);
-    test_pattern("(?<quote>['\"]).*\\k<quote>", true, default_flags);
-    test_pattern("(a)\\2", false, default_flags);   // Backref to non-existent group
-    test_pattern("\\1(a)", false, default_flags);   // Forward reference (invalid)
-    test_pattern("(?<a>a)(?<a>b)", false, default_flags); // Duplicate named group
-    test_pattern("\\k<a>(?<a>a)", false, default_flags); // Forward named reference (invalid)
-    test_pattern("(?<word>\\w+)\\s+\\k<undefined>", false, default_flags); // Undefined named backref
-    test_pattern("(?<invalid-name>)", false, default_flags); // Invalid group name
-
-    printf("\n--- SECTION 3: Advanced Grouping (PCRE/Perl Features) ---\n");
-    test_pattern("(?>a|ab)c", true, default_flags); // Atomic Group
-    test_pattern("(?|a(b)|c(d))", true, default_flags); // Branch-reset group
-    test_pattern("(?|(a)|(b))\\1", true, default_flags); // Branch-reset backreference
-    test_pattern("(a)?(?(1)b|c)", true, default_flags); // Conditional on capture
-    test_pattern("(a)?(?(1)b)", true, default_flags); // Conditional without false branch
-    test_pattern("(?<foo>a)?(?(<foo>)b|c)", true, default_flags); // Conditional on named capture
-    test_pattern("(?(?=a)a|b)", true, default_flags); // Conditional on assertion
-    test_pattern("(?<a>a)b(?1)", true, default_flags); // Subroutine call by number
-    test_pattern("(?<a>a)b(?&a)", true, default_flags); // Subroutine call by name
-    test_pattern("((a)b(?2))", true, default_flags); // Recursive subroutine call
-    test_pattern("(a)(?R)", true, default_flags); // Full pattern recursion
-
-    printf("\n--- SECTION 4: Assertions ---\n");
-    test_pattern("a(?!b)c", true, default_flags);   // Negative lookahead
-    test_pattern("a(?=b)b", true, default_flags);   // Positive lookahead
-    test_pattern("(?<=a)b", true, default_flags);   // Positive lookbehind
-    test_pattern("(?<!a)b", true, default_flags);  // Negative lookbehind
-    test_pattern("a(?=b(?=c))d", true, default_flags); // Nested lookahead
-    test_pattern("(?<=a|b)c", true, default_flags); // Lookbehind with fixed-width alternation
-    test_pattern("(?<=a|bc)d", false, default_flags);// Lookbehind with variable-width alternation
-    test_pattern("(?<=a*)b", false, default_flags); // Lookbehind with unbounded quantifier
-
-    printf("\n--- SECTION 5: Anchors & Character Classes ---\n");
-    test_pattern("^[a-zA-Z_][a-zA-Z0-9_]*$", true, default_flags);
-    test_pattern("\\bword\\b", true, default_flags);
-    test_pattern("\\Aa\\B.", true, default_flags);
-    test_pattern("end\\z", true, default_flags);
-    test_pattern("[[:digit:]]+", true, default_flags); // POSIX class
-    test_pattern("[^[:space:]]", true, default_flags);
-    test_pattern("\\p{L}", true, default_flags);      // Unicode property
-    test_pattern("\\P{L}", true, default_flags);      // Negated Unicode property
-    test_pattern("[a-z\\d]", true, default_flags);    // Mixed class
-    test_pattern("[\\d-a]", false, default_flags);    // Invalid range
-    test_pattern("[]a]", true, default_flags);        // Literal ']' at start
-    test_pattern("[a-]", true, default_flags);        // Literal '-' at end
-    test_pattern("a^", false, default_flags);         // Misplaced anchor
-    test_pattern("[]", false, default_flags);         // Empty class
-    test_pattern("[^]", false, default_flags);        // Empty negated class
-
-    printf("\n--- SECTION 6: Escapes, Comments & Flags ---\n");
-    test_pattern("\\d{2,4}-\\w+", true, default_flags);
-    test_pattern("a(?#comment)b", true, default_flags);
-    test_pattern("\\x{1F600}", true, default_flags); // 4-byte UTF-8 char
-    test_pattern("\\t\\n\\r\\f", true, default_flags);
-    test_pattern("\\Q*+?.()[]\\E", true, default_flags); // Quoted sequence
-    test_pattern("(?i)case", true, default_flags);   // Inline flag
-    test_pattern("(?i:case)sensitive", true, default_flags); // Scoped flag
-    test_pattern("(?i)c(?-i:ase)s", true, default_flags); // Flag modification
-    test_pattern("\\", false, default_flags);        // Trailing escape
-    test_pattern("a(?#unclosed comment", false, default_flags);
-    
-    printf("\n--- SECTION 7: Unicode & Real-World Patterns ---\n");
-    test_pattern("你好世界", true, default_flags);
-    test_pattern("a[α-ω]b", true, default_flags);
-    test_pattern("^([a-z0-9_\\.-]+)@([\\da-z\\.-]+)\\.([a-z\\.]{2,6})$", true, default_flags); // Email
-    test_pattern("https?://(www\\.)?[-a-zA-Z0-9@:%._\\+~#=]{2,256}\\.[a-z]{2,6}\\b([-a-zA-Z0-9@:%_\\+.~#?&//=]*)", true, default_flags); // URL
-
-    printf("\n--- SECTION 8: General Error Handling ---\n");
-    test_pattern("a(b|c", false, default_flags);     // Unmatched parenthesis
-    test_pattern("a)", false, default_flags);        // Unmatched closing parenthesis
-    test_pattern("a[b-", false, default_flags);      // Unclosed character class
-    test_pattern("\\p{Invalid}", false, default_flags); // Unknown Unicode property
-    test_pattern("(?(2)a|b)", false, default_flags); // Conditional on non-existent group
-    test_pattern("a(?<=b)++", false, default_flags); // Quantifying an assertion
-
-
-    printf("====================================================\n");
-    printf("FINAL REPORT\n");
-    printf("----------------------------------------------------\n");
-    printf("TOTAL TESTS:    %d\n", total_tests);
-    printf("TOTAL FAILURES: %d\n", total_failures);
-    if (total_failures == 0) {
-        printf("\n>>>>> ALL TESTS PASSED <<<<<\n");
-    } else {
-        printf("\n>>>>> SOME TESTS FAILED <<<<<\n");
-    }
-    printf("====================================================\n");
-
-    // Cleanup before exit
-    regex_cleanup_property_cache();
-
-    test_match();
-
-    return total_failures;
-}
-#endif // TEST_MAIN

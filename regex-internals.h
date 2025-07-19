@@ -141,135 +141,80 @@
 ===============================================================================
 */
 
-#ifndef REGEX_PARSER_H
-#define REGEX_PARSER_H
+#ifndef REGEX_INTERNALS_H
+#define REGEX_INTERNALS_H
 
-#include <stdint.h>
-#include <stdbool.h>
-#include <stddef.h>
+#include "regex-parser.h"
 
 //==============================================================================
 //
-//  DLL EXPORT/IMPORT
+//  PRIVATE INTERNALS - DO NOT USE DIRECTLY
 //
 //==============================================================================
 
-#ifndef LIBREX_API
-    #if defined(_WIN32) || defined(__CYGWIN__)
-        #if defined(LIBREX_BUILD_DLL)
-            #define LIBREX_API __declspec(dllexport)
-        #elif defined(LIBREX_DLL)
-            #define LIBREX_API __declspec(dllimport)
-        #else
-            #define LIBREX_API
-        #endif
-    #elif __GNUC__ >= 4
-        #define LIBREX_API __attribute__((visibility("default")))
-    #else
-        #define LIBREX_API
-    #endif
-#endif
+#define MAX_CACHED_PROPERTIES 32
 
-//==============================================================================
-//
-//  PUBLIC API
-//
-//==============================================================================
+typedef struct Block {
+    void *data;
+    size_t used;
+    size_t cap;
+    struct Block *next;
+} Block;
 
-// Regex compilation flags
-#define REG_IGNORECASE  0x01
-#define REG_MULTILINE   0x02
-#define REG_SINGLELINE  0x04
-#define REG_EXTENDED    0x08
-#define REG_UNGREEDY    0x10
+typedef struct AstArena {
+    Block *blocks;
+    size_t total_allocated;
+    regex_allocator allocator;
+    struct {
+            char* name;  // Or use a dynamic array if needed
+            uint32_t* bitmap;
+        } property_cache[MAX_CACHED_PROPERTIES];
+        int property_cache_count;
+} AstArena;
 
-// Error codes for regex_err
-#define REGEX_OK                 0
-#define REGEX_ERR_MEMORY         1
-#define REGEX_ERR_INVALID_SYNTAX 2
-#define REGEX_ERR_INVALID_UTF8   3
-#define REGEX_ERR_INVALID_ESCAPE 4
-#define REGEX_ERR_INVALID_CLASS  5
-#define REGEX_ERR_INVALID_QUANT  6
-#define REGEX_ERR_INVALID_GROUP  7
-#define REGEX_ERR_INVALID_BACKREF 8
-#define REGEX_ERR_INVALID_PROP   9
-#define REGEX_ERR_UNMATCHED_PAREN 10
-#define REGEX_ERR_INVALID_RANGE  11
-#define REGEX_ERR_LOOKBEHIND_VAR 12
-#define REGEX_ERR_LOOKBEHIND_LONG 13
-#define REGEX_ERR_DUPLICATE_NAME 14
-#define REGEX_ERR_UNDEFINED_GROUP 15
-#define REGEX_ERR_INVALID_CONDITION 16
-#define REGEX_ERR_RECURSION_LIMIT 17
+// --- Internal data structures ---
 
-// 1.2 Formal error object
-typedef struct {
-    int code;        // Error code (one of REGEX_ERR_*)
-    int pos;         // Character position in pattern string
-    int line;        // Line number (1-based)
-    int col;         // Column number (1-based)
-    const char* msg; // Human-readable error message string
-} regex_err;
+typedef enum {
+    REGEX_NODE_CHAR, REGEX_NODE_DOT, REGEX_NODE_ANCHOR, REGEX_NODE_CHAR_CLASS, REGEX_NODE_CONCAT,
+    REGEX_NODE_ALTERNATION, REGEX_NODE_QUANTIFIER, REGEX_NODE_GROUP, REGEX_NODE_BACKREF, REGEX_NODE_ASSERTION,
+    REGEX_NODE_COMMENT, REGEX_NODE_UNI_PROP, REGEX_NODE_BRESET_GROUP, REGEX_NODE_CONDITIONAL, REGEX_NODE_SUBROUTINE
+} RegexNodeType;
 
-// 1.3 Allocator pluggability
-typedef struct {
-    void* (*malloc_func)(size_t size, void* user_data);
-    void (*free_func)(void* ptr, void* user_data);
-    void* (*realloc_func)(void* ptr, size_t new_size, void* user_data);
-    void* user_data; // Opaque pointer passed to allocator functions
-} regex_allocator;
+typedef enum {
+    ASSERT_LOOKAHEAD_POS, ASSERT_LOOKAHEAD_NEG,
+    ASSERT_LOOKBEHIND_POS, ASSERT_LOOKBEHIND_NEG
+} AssertionType;
 
-// 1.1 Two-stage API: Opaque handle for a compiled regular expression
-typedef struct regex_compiled regex_compiled;
+typedef enum { QUANT_GREEDY, QUANT_LAZY, QUANT_POSSESSIVE } QuantifierType;
 
-// Match result structure (to be used by regex_match)
-typedef struct {
-    int match_start;
-    int match_end;
-    int* capture_starts;
-    int* capture_ends;
-    int capture_count;
-} regex_match_result;
+typedef enum { COND_INVALID = 0, COND_NUMERIC, COND_NAMED, COND_ASSERTION } ConditionType;
 
+typedef struct Condition {
+    ConditionType type;
+    union {
+        int group_index;
+        char *group_name;
+        struct RegexNode *assertion;
+    } data;
+} Condition;
 
-// --- Primary API Functions ---
+typedef struct RegexNode {
+    RegexNodeType type;
+    int token_start;
+    int token_end;
+    union {
+        uint32_t codepoint;
+        char anchor_type;
+        struct { char *set; bool negated; bool is_posix; } char_class;
+        struct { struct RegexNode *left; struct RegexNode *right; } children;
+        struct { struct RegexNode *child; int min; int max; QuantifierType quant_type; } quantifier;
+        struct { struct RegexNode *child; int capture_index; char *name; bool is_atomic; uint32_t enter_flags; uint32_t exit_flags; } group;
+        struct { int ref_index; char *ref_name; } backref;
+        struct { struct RegexNode *child; AssertionType assert_type; } assertion;
+        struct { bool negated; char *prop_name; } uni_prop;
+        struct { Condition cond; struct RegexNode *if_true; struct RegexNode *if_false; } conditional;
+        struct { bool is_recursion; int target_index; char *target_name; } subroutine;
+    } data;
+} RegexNode;
 
-// Compile a regex pattern using a custom allocator.
-LIBREX_API regex_compiled* regex_compile_with_allocator(
-    const char* pattern,
-    uint32_t flags,
-    const regex_allocator* allocator,
-    regex_err* error
-);
-
-// Compile a regex pattern using the standard library allocators (malloc, etc.).
-LIBREX_API regex_compiled* regex_compile(
-    const char* pattern,
-    uint32_t flags,
-    regex_err* error
-);
-
-// Free a compiled regex object.
-LIBREX_API void regex_free(regex_compiled* rx);
-
-// Execute a match against a subject string (currently a placeholder).
-LIBREX_API int regex_match(
-    regex_compiled* rx,
-    const char* subject,
-    size_t subject_len,
-    regex_match_result* result
-);
-
-// Free a match result object.
-LIBREX_API void regex_free_match_result(regex_match_result* result, const regex_allocator* allocator);
-
-// --- Utility Functions ---
-
-// Get a standard error message string from an error code.
-LIBREX_API const char* regex_error_message(int error_code);
-
-// Print the AST for debugging purposes
-LIBREX_API void print_regex_ast(const regex_compiled* node);
-
-#endif // REGEX_PARSER_H
+#endif // REGEX_INTERNALS_H

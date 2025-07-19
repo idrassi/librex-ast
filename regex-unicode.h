@@ -141,135 +141,33 @@
 ===============================================================================
 */
 
-#ifndef REGEX_PARSER_H
-#define REGEX_PARSER_H
+#ifndef REGEX_UNICODE_H
+#define REGEX_UNICODE_H
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include "regex-internals.h"
 
-//==============================================================================
-//
-//  DLL EXPORT/IMPORT
-//
-//==============================================================================
+// Number of 32‑bit words needed to cover U+0000–U+10FFFF
+#define UNI_BM_WORDS  (0x110000/32)
 
-#ifndef LIBREX_API
-    #if defined(_WIN32) || defined(__CYGWIN__)
-        #if defined(LIBREX_BUILD_DLL)
-            #define LIBREX_API __declspec(dllexport)
-        #elif defined(LIBREX_DLL)
-            #define LIBREX_API __declspec(dllimport)
-        #else
-            #define LIBREX_API
-        #endif
-    #elif __GNUC__ >= 4
-        #define LIBREX_API __attribute__((visibility("default")))
-    #else
-        #define LIBREX_API
-    #endif
-#endif
-
-//==============================================================================
-//
-//  PUBLIC API
-//
-//==============================================================================
-
-// Regex compilation flags
-#define REG_IGNORECASE  0x01
-#define REG_MULTILINE   0x02
-#define REG_SINGLELINE  0x04
-#define REG_EXTENDED    0x08
-#define REG_UNGREEDY    0x10
-
-// Error codes for regex_err
-#define REGEX_OK                 0
-#define REGEX_ERR_MEMORY         1
-#define REGEX_ERR_INVALID_SYNTAX 2
-#define REGEX_ERR_INVALID_UTF8   3
-#define REGEX_ERR_INVALID_ESCAPE 4
-#define REGEX_ERR_INVALID_CLASS  5
-#define REGEX_ERR_INVALID_QUANT  6
-#define REGEX_ERR_INVALID_GROUP  7
-#define REGEX_ERR_INVALID_BACKREF 8
-#define REGEX_ERR_INVALID_PROP   9
-#define REGEX_ERR_UNMATCHED_PAREN 10
-#define REGEX_ERR_INVALID_RANGE  11
-#define REGEX_ERR_LOOKBEHIND_VAR 12
-#define REGEX_ERR_LOOKBEHIND_LONG 13
-#define REGEX_ERR_DUPLICATE_NAME 14
-#define REGEX_ERR_UNDEFINED_GROUP 15
-#define REGEX_ERR_INVALID_CONDITION 16
-#define REGEX_ERR_RECURSION_LIMIT 17
-
-// 1.2 Formal error object
+// Unicode category mappings
 typedef struct {
-    int code;        // Error code (one of REGEX_ERR_*)
-    int pos;         // Character position in pattern string
-    int line;        // Line number (1-based)
-    int col;         // Column number (1-based)
-    const char* msg; // Human-readable error message string
-} regex_err;
+    uint32_t start;
+    uint32_t end;
+    const char* category;
+} UnicodeRange;
 
-// 1.3 Allocator pluggability
-typedef struct {
-    void* (*malloc_func)(size_t size, void* user_data);
-    void (*free_func)(void* ptr, void* user_data);
-    void* (*realloc_func)(void* ptr, size_t new_size, void* user_data);
-    void* user_data; // Opaque pointer passed to allocator functions
-} regex_allocator;
+// UTF-8 decoding function
+bool utf8_codepoint(const uint8_t *s, size_t len, size_t *i, uint32_t *cp);
 
-// 1.1 Two-stage API: Opaque handle for a compiled regular expression
-typedef struct regex_compiled regex_compiled;
+// Unicode property bitmap functions
+uint32_t* build_unicode_property_bitmap(const char* prop_name, AstArena* arena);
+uint32_t* build_class_bitmap(const char *spec, AstArena *arena);
 
-// Match result structure (to be used by regex_match)
-typedef struct {
-    int match_start;
-    int match_end;
-    int* capture_starts;
-    int* capture_ends;
-    int capture_count;
-} regex_match_result;
+// Helper functions
+void set_bit_in_bitmap(uint32_t* bitmap, uint32_t codepoint);
+bool property_matches(const char* prop_name, const char* target);
 
-
-// --- Primary API Functions ---
-
-// Compile a regex pattern using a custom allocator.
-LIBREX_API regex_compiled* regex_compile_with_allocator(
-    const char* pattern,
-    uint32_t flags,
-    const regex_allocator* allocator,
-    regex_err* error
-);
-
-// Compile a regex pattern using the standard library allocators (malloc, etc.).
-LIBREX_API regex_compiled* regex_compile(
-    const char* pattern,
-    uint32_t flags,
-    regex_err* error
-);
-
-// Free a compiled regex object.
-LIBREX_API void regex_free(regex_compiled* rx);
-
-// Execute a match against a subject string (currently a placeholder).
-LIBREX_API int regex_match(
-    regex_compiled* rx,
-    const char* subject,
-    size_t subject_len,
-    regex_match_result* result
-);
-
-// Free a match result object.
-LIBREX_API void regex_free_match_result(regex_match_result* result, const regex_allocator* allocator);
-
-// --- Utility Functions ---
-
-// Get a standard error message string from an error code.
-LIBREX_API const char* regex_error_message(int error_code);
-
-// Print the AST for debugging purposes
-LIBREX_API void print_regex_ast(const regex_compiled* node);
-
-#endif // REGEX_PARSER_H
+#endif // REGEX_UNICODE_H
