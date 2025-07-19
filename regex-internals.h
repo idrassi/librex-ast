@@ -172,6 +172,41 @@ typedef struct AstArena {
         int property_cache_count;
 } AstArena;
 
+// --- Bytecode Instructions ---
+typedef enum {
+    I_END, I_CHAR, I_ANY, I_SPLIT, I_JMP, I_SAVE,
+    I_RANGE, I_UNIPROP,
+    I_BOUND,          /*  word‑boundary  (\b)              */
+    I_NBOUND,         /* ­non‑word‑boundary (\B) */
+    I_SBOL, I_SEOL,   /*  begin/end of subject (\A, \z)    */
+    I_BOL, I_EOL, I_MATCH,
+    I_BACKREF, I_GCOND,
+    I_ACOND, I_ASUCCESS, I_CALL, I_RETURN,
+    I_MARK_ATOMIC, I_CUT_TO_MARK,
+    I_LBCOND,
+    I_MBOL, I_MEOL
+} IType;
+
+typedef struct {
+    uint8_t op;
+    uintptr_t val;        /* char / index / bit pattern               */
+    int32_t  x;          /* addr1 for JMP / SPLIT / sub_pattern_pc     */
+    int32_t  y;          /* addr2 for SPLIT / no_branch_pc             */
+} Instr;
+
+typedef struct {
+    int group_index;
+    char *group_name;
+    size_t start_pc;
+} SubroutineDef;
+
+typedef struct {
+    SubroutineDef *defs;
+    int count;
+    int capacity;
+} SubroutineTable;
+
+
 // --- Internal data structures ---
 
 typedef enum {
@@ -216,5 +251,21 @@ typedef struct RegexNode {
         struct { bool is_recursion; int target_index; char *target_name; } subroutine;
     } data;
 } RegexNode;
+
+// The full, internal definition of the compiled regex object.
+struct regex_compiled {
+    RegexNode* ast;             // The AST (kept for debugging/inspection)
+    AstArena* arena;            // Arena for AST and compile-time data
+    uint32_t flags;
+    int capture_count;
+    regex_allocator allocator;
+
+    // --- Pre-compiled Bytecode ---
+    Instr* code;                // The compiled bytecode
+    size_t pc;                  // Number of instructions in the bytecode
+};
+
+// Internal function to perform the AST -> Bytecode compilation step.
+int compile_regex_to_bytecode(struct regex_compiled* rx, regex_err* error);
 
 #endif // REGEX_INTERNALS_H

@@ -154,48 +154,6 @@
 #define alloca _alloca
 #endif
 
-// Opaque struct definition, hidden from the public header.
-struct regex_compiled {
-    RegexNode* ast;
-    AstArena* arena;
-    uint32_t flags;
-    int capture_count;
-    regex_allocator allocator;
-};
-
-typedef enum {
-    I_END, I_CHAR, I_ANY, I_SPLIT, I_JMP, I_SAVE,
-    I_RANGE, I_UNIPROP,
-    I_BOUND,          /*  word‑boundary  (\b)              */
-    I_NBOUND,         /* ­non‑word‑boundary (\B) */
-    I_SBOL, I_SEOL,   /*  begin/end of subject (\A, \z)    */
-    I_BOL, I_EOL, I_MATCH,
-    I_BACKREF, I_GCOND,
-    I_ACOND, I_ASUCCESS, I_CALL, I_RETURN,
-    I_MARK_ATOMIC, I_CUT_TO_MARK,
-    I_LBCOND,
-    I_MBOL, I_MEOL
-} IType;
-
-typedef struct {
-    uint8_t op;
-    uintptr_t val;        /* char / index / bit pattern               */
-    int32_t  x;          /* addr1 for JMP / SPLIT / sub_pattern_pc     */
-    int32_t  y;          /* addr2 for SPLIT / no_branch_pc             */
-} Instr;
-
-typedef struct {
-    int group_index;
-    char *group_name;
-    size_t start_pc;
-} SubroutineDef;
-
-typedef struct {
-    SubroutineDef *defs;
-    int count;
-    int capacity;
-} SubroutineTable;
-
 typedef struct {
     Instr *code;
     size_t pc, capsize;
@@ -372,7 +330,7 @@ static bool ic_after_node(const RegexNode *n, bool ic_before)
             if (n->data.group.child == NULL)          /* (?i)          */
                 return (n->data.group.exit_flags & REG_IGNORECASE) != 0;
 
-            /* ordinary group – flags inside do not leak out            */
+            /* ordinary group – flags inside do not leak out            */
             return ic_before;
 
         /* concatenation: evaluate left then right                      */
@@ -1452,23 +1410,17 @@ static int run_vm_engine(
 }
 
 /* -------------- finally the public function ------------------- */
-
-int
-regex_match(regex_compiled *rx,
-            const char *subject,
-            size_t subject_len,
-            regex_match_result *result)
-{
-    if (!rx || !subject || !result) return 0;
-
+int compile_regex_to_bytecode(regex_compiled* rx, regex_err* error) {
     CodeBuf buf = {0};
     buf.alloc = &rx->allocator;
-    buf.arena = rx->arena;  // Pass arena to CodeBuf
+    buf.arena = rx->arena;
     init_codebuf_subroutines(&buf, rx->capture_count);
-    
+
     // Check for initialization failure
     if (buf.oom) {
         cleanup_codebuf_subroutines(&buf);
+        error->code = REGEX_ERR_MEMORY;
+        error->msg = regex_error_message(REGEX_ERR_MEMORY);
         return REGEX_ERR_MEMORY;
     }
 
@@ -1480,12 +1432,32 @@ regex_match(regex_compiled *rx,
     emit(&buf, (Instr){.op = I_SAVE, .val = 1});
     emit(&buf, (Instr){.op = I_MATCH});
 
-    // Check for compilation errors
     if (buf.oom) {
         cleanup_codebuf_subroutines(&buf);
         if (buf.code) rx->allocator.free_func(buf.code, rx->allocator.user_data);
+        error->code = REGEX_ERR_MEMORY;
+        error->msg = regex_error_message(REGEX_ERR_MEMORY);
         return REGEX_ERR_MEMORY;
     }
+
+    // Transfer ownership of bytecode to the regex_compiled struct
+    rx->code = buf.code;
+    rx->pc = buf.pc;
+
+    // Prevent cleanup from freeing the transferred code
+    buf.code = NULL;
+    cleanup_codebuf_subroutines(&buf);
+
+    return REGEX_OK;
+}
+
+int
+regex_match(regex_compiled *rx,
+            const char *subject,
+            size_t subject_len,
+            regex_match_result *result)
+{
+    if (!rx || !subject || !result || !rx->code) return 0;
 
     int capture = rx->capture_count;
     // Temporary arrays for capture positions
@@ -1494,8 +1466,6 @@ regex_match(regex_compiled *rx,
     if (!temp_starts || !temp_ends) {
         if (temp_starts) rx->allocator.free_func(temp_starts, rx->allocator.user_data);
         if (temp_ends) rx->allocator.free_func(temp_ends, rx->allocator.user_data);
-        cleanup_codebuf_subroutines(&buf);
-        if (buf.code) rx->allocator.free_func(buf.code, rx->allocator.user_data);
         return REGEX_ERR_MEMORY;
     }
 
@@ -1506,14 +1476,12 @@ regex_match(regex_compiled *rx,
             temp_starts[i] = -1;
             temp_ends[i] = -1;
         }
-        match_result = run_vm(buf.code, buf.pc, (const uint8_t*)subject, subject_len, capture, temp_starts, temp_ends, offset);
+        match_result = run_vm(rx->code, rx->pc, (const uint8_t*)subject, subject_len, capture, temp_starts, temp_ends, offset);
         
         // Check for errors from run_vm
         if (match_result < 0) {
             rx->allocator.free_func(temp_starts, rx->allocator.user_data);
             rx->allocator.free_func(temp_ends, rx->allocator.user_data);
-            cleanup_codebuf_subroutines(&buf);
-            if (buf.code) rx->allocator.free_func(buf.code, rx->allocator.user_data);
             return -match_result;  // Convert back to positive error code
         }
     }
@@ -1538,8 +1506,6 @@ regex_match(regex_compiled *rx,
             if (result->capture_ends) rx->allocator.free_func(result->capture_ends, rx->allocator.user_data);
             rx->allocator.free_func(temp_starts, rx->allocator.user_data);
             rx->allocator.free_func(temp_ends, rx->allocator.user_data);
-            cleanup_codebuf_subroutines(&buf);
-            if (buf.code) rx->allocator.free_func(buf.code, rx->allocator.user_data);
             return REGEX_ERR_MEMORY;
         }
 
@@ -1555,9 +1521,6 @@ regex_match(regex_compiled *rx,
         rx->allocator.free_func(temp_starts, rx->allocator.user_data);
         rx->allocator.free_func(temp_ends, rx->allocator.user_data);
     }
-
-    cleanup_codebuf_subroutines(&buf);
-    if (buf.code) rx->allocator.free_func(buf.code, rx->allocator.user_data);
 
     return match_result;  // 1 for match, 0 for no match
 }

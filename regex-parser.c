@@ -155,15 +155,6 @@
 #include "regex-unicode.h"
 #include "regex-internals.h"
 
-// Opaque struct definition, hidden from the public header.
-struct regex_compiled {
-    RegexNode* ast;
-    AstArena* arena;
-    uint32_t flags;
-    int capture_count;
-    regex_allocator allocator;
-};
-
 // ----------------------------------------------------------------------------
 // 1. Allocator Implementation
 // ----------------------------------------------------------------------------
@@ -1850,10 +1841,17 @@ regex_compiled* regex_compile_with_allocator(
     rx->allocator = *allocator;
     rx->flags = flags;
 
+    // Stage 1: Parse pattern into AST
     rx->ast = regex_parse_internal(pattern, flags, allocator, &rx->arena, &rx->capture_count, error);
 
     if (!rx->ast) {
         allocator->free_func(rx, allocator->user_data);
+        return NULL;
+    }
+
+    // Stage 2: Compile AST to bytecode
+    if (compile_regex_to_bytecode(rx, error) != REGEX_OK) {
+        regex_free(rx); // This will free ast, arena, etc.
         return NULL;
     }
 
@@ -1873,6 +1871,10 @@ void regex_free(regex_compiled* rx) {
         free_regex_ast(rx->ast, &allocator);
         arena_free(rx->arena);
         allocator.free_func(rx->arena, allocator.user_data);
+    }
+
+    if (rx->code) {
+        allocator.free_func(rx->code, allocator.user_data);
     }
 
     allocator.free_func(rx, allocator.user_data);
