@@ -20,6 +20,26 @@ add_library(librex_ast_static STATIC ${LIB_SRC})
 set_target_properties(librex_ast_shared PROPERTIES OUTPUT_NAME "librex_ast")
 set_target_properties(librex_ast_static PROPERTIES OUTPUT_NAME "librex_ast")
 
+# Fix MSYS2/MinGW naming conventions
+if(MSYS OR MINGW)
+    # Remove the "lib" prefix and force .dll/.a extensions
+    set_target_properties(librex_ast_shared PROPERTIES 
+        PREFIX ""
+        SUFFIX ".dll"
+        ARCHIVE_OUTPUT_NAME "librex_ast.dll"
+    )
+    set_target_properties(librex_ast_static PROPERTIES 
+        PREFIX ""
+        SUFFIX ".a"
+    )
+    
+    # Prevent MSYS2 from adding "msys-" prefix
+    set_target_properties(librex_ast_shared PROPERTIES 
+        RUNTIME_OUTPUT_NAME "librex_ast"
+        LIBRARY_OUTPUT_NAME "librex_ast"
+    )
+endif()
+
 # Create test executable
 add_executable(regex_test ${TEST_SRC})
 
