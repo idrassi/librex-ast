@@ -261,7 +261,7 @@ LIBREX_API regex_compiled* regex_compile(
 // Free a compiled regex object.
 LIBREX_API void regex_free(regex_compiled* rx);
 
-// Execute a match against a subject string (currently a placeholder).
+// Execute a match against a subject string
 LIBREX_API int regex_match(
     regex_compiled* rx,
     const char* subject,
