@@ -640,6 +640,7 @@ static size_t compile_quantifier(CodeBuf *b, RegexNode *n, bool ic, bool dotnl, 
     
     int m = n->data.quantifier.min;
     int M = n->data.quantifier.max;
+    QuantifierType qtype = n->data.quantifier.quant_type;
 
     if (!m && M == 0) return 0;
     if (m == 1 && M == 1) {
@@ -647,43 +648,62 @@ static size_t compile_quantifier(CodeBuf *b, RegexNode *n, bool ic, bool dotnl, 
         return 0;
     }
 
-    // Compile minimum repetitions
+    // Compile minimum repetitions. This part is not atomic.
     for (int i = 0; i < m; ++i) {
         compile_node(b, n->data.quantifier.child, ic, dotnl, multiline);
     }
 
-    // Handle optional repetitions
-    if (M < 0) { // * or +
+    // If there are no optional repetitions, we are done.
+    if (M == m) {
+        return 0;
+    }
+
+    // The optional part (from m to M) is handled next.
+    // For possessive quantifiers, this entire optional part is made atomic.
+    if (qtype == QUANT_POSSESSIVE) {
+        emit(b, (Instr){.op = I_MARK_ATOMIC});
+    }
+
+    // Handle optional repetitions (from m to M, or m to infinity)
+    if (M < 0) { // e.g., a*, a+, a{m,}
         size_t loop_start = b->pc;
         emit(b, (Instr){.op = I_SPLIT, .x = 0, .y = 0});
         size_t body_start = b->pc;
         compile_node(b, n->data.quantifier.child, ic, dotnl, multiline);
         emit(b, (Instr){.op = I_JMP, .x = (int32_t)loop_start});
 
-        // For lazy quantifiers, prefer the exit path
-        if (n->data.quantifier.quant_type == QUANT_LAZY) {
+        // For lazy quantifiers, prefer the exit path.
+        // Possessive falls through to greedy logic, which is correct inside the atomic block.
+        if (qtype == QUANT_LAZY) {
             b->code[loop_start].x = (int32_t)b->pc;      // exit first
             b->code[loop_start].y = (int32_t)body_start; // loop second
-        } else { // QUANT_GREEDY
+        } else { // QUANT_GREEDY or QUANT_POSSESSIVE
             b->code[loop_start].x = (int32_t)body_start; // loop first
             b->code[loop_start].y = (int32_t)b->pc;      // exit second
         }
-    } else if (M > m) { // Fixed upper bound
+    } else if (M > m) { // e.g., a{m,M}
+        // Create a chain of optional matches
         for (int i = m; i < M; ++i) {
             size_t split_addr = b->pc;
             emit(b, (Instr){.op = I_SPLIT, .x = 0, .y = 0});
             size_t body_start = b->pc;
             compile_node(b, n->data.quantifier.child, ic, dotnl, multiline);
     
-            if (n->data.quantifier.quant_type == QUANT_LAZY) {
+            if (qtype == QUANT_LAZY) {
                 b->code[split_addr].x = (int32_t)b->pc;      // skip first
                 b->code[split_addr].y = (int32_t)body_start; // match second
-            } else {
+            } else { // QUANT_GREEDY or QUANT_POSSESSIVE
                 b->code[split_addr].x = (int32_t)body_start; // match first
                 b->code[split_addr].y = (int32_t)b->pc;      // skip second
             }
         }
     }
+    
+    // Close the atomic block if it was a possessive quantifier.
+    if (qtype == QUANT_POSSESSIVE) {
+        emit(b, (Instr){.op = I_CUT_TO_MARK});
+    }
+    
     return 0;
 }
 
